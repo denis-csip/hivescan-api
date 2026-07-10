@@ -94,7 +94,8 @@ def _ideas_signin(email, password):
 @app.get("/auth-status")
 def auth_status():
     """Le POC interroge cet endpoint (ouvert) pour savoir s'il doit afficher le login."""
-    return {"login_required": _AUTH_REQUIRED, "ideas": bool(SESSION_SECRET)}
+    return {"login_required": _AUTH_REQUIRED, "ideas": bool(SESSION_SECRET),
+            "storage_ready": studies_col is not None}
 
 @app.post("/ideas-login")
 async def ideas_login(request: Request):
