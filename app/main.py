@@ -12,6 +12,8 @@ import time
 import hmac
 import hashlib
 import base64
+import uuid
+import datetime
 import unicodedata
 import urllib.request
 import urllib.parse
@@ -73,7 +75,8 @@ def _ideas_signin(email, password):
     """Valide les identifiants auprès de l'API GraphQL IDEAS (repris d'ARIZ-Copilot)."""
     esc = lambda s: s.replace("\\", "\\\\").replace('"', '\\"')
     mutation = ('mutation { signin(email: "%s", password: "%s") '
-                '{ id name email token } }' % (esc(email), esc(password)))
+                '{ id name email token job avatar organizations { id name } } }'
+                % (esc(email), esc(password)))
     body = json.dumps({"query": mutation}).encode()
     req = urllib.request.Request(
         IDEAS_ENDPOINT, data=body, method="POST",
@@ -105,8 +108,62 @@ async def ideas_login(request: Request):
     u, err = _ideas_signin(email, password)
     if err or not u:
         raise HTTPException(status_code=401, detail="Identifiants IDEAS invalides.")
+    orgs = [o.get("name") for o in (u.get("organizations") or []) if o.get("name")]
     return {"token": _make_token(u.get("email") or email),
-            "name": u.get("name"), "email": u.get("email") or email}
+            "name": u.get("name"), "email": u.get("email") or email,
+            "avatar": u.get("avatar"), "job": u.get("job"), "organizations": orgs}
+
+# --- Études sauvegardées par utilisateur (persistance façon ARIZ-Copilot) ----------
+# Chaque étude = une recherche sauvegardée (mots-clés + filtres), rattachée à l'email
+# IDEAS. Écriture via la connexion RW (studies_col). Le user est identifié par son jeton.
+def _current_email(request: Request):
+    auth = request.headers.get("authorization") or ""
+    tok = auth[7:] if auth[:7].lower() == "bearer " else None
+    return (_verify_token(tok) or {}).get("email") if tok else None
+
+def _study_public(d):
+    return {"id": d.get("sid"), "name": d.get("name"), "query": d.get("query") or [],
+            "jurisdiction": d.get("jurisdiction"), "innovation_min": d.get("innovation_min"),
+            "result_count": d.get("result_count"), "created": d.get("created"), "updated": d.get("updated")}
+
+@app.get("/studies")
+def list_studies(request: Request):
+    email = _current_email(request)
+    if not email or studies_col is None:
+        return {"studies": [], "storage": studies_col is not None}
+    docs = list(studies_col.find({"email": email}, {"_id": 0}).sort("updated", -1).limit(100))
+    return {"studies": [_study_public(d) for d in docs], "storage": True}
+
+@app.post("/studies")
+async def save_study(request: Request):
+    email = _current_email(request)
+    if not email:
+        raise HTTPException(status_code=401, detail="Non authentifié.")
+    if studies_col is None:
+        raise HTTPException(status_code=503, detail="Stockage des études non configuré (MONGO_URI_RW).")
+    body = await request.json()
+    q = body.get("query") or []
+    if isinstance(q, str):
+        q = [q]
+    now = datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    doc = {"sid": uuid.uuid4().hex, "email": email,
+           "name": (body.get("name") or " ".join(q) or "Étude").strip()[:120],
+           "query": [str(k) for k in q][:12],
+           "jurisdiction": body.get("jurisdiction"),
+           "innovation_min": body.get("innovation_min"),
+           "result_count": body.get("result_count"),
+           "created": now, "updated": now}
+    studies_col.insert_one(dict(doc))
+    return _study_public(doc)
+
+@app.delete("/studies/{sid}")
+def delete_study(sid: str, request: Request):
+    email = _current_email(request)
+    if not email:
+        raise HTTPException(status_code=401, detail="Non authentifié.")
+    if studies_col is not None:
+        studies_col.delete_one({"sid": sid, "email": email})
+    return {"deleted": sid}
 
 # --- CORS : ajouté EN DERNIER = middleware le plus EXTERNE, pour que ses en-têtes
 # s'appliquent AUSSI aux réponses 401 du gate (sinon le navigateur bloque la lecture
@@ -116,7 +173,7 @@ _allow_origins = ["*"] if _origins_env == "*" else [o.strip() for o in _origins_
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allow_origins,
-    allow_methods=["GET", "POST", "OPTIONS"],   # POST requis pour /ideas-login
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],   # POST=login, DELETE=études
     allow_headers=["*"],
 )
 
@@ -142,6 +199,18 @@ MAX_SEARCH_DOCS = int(os.getenv("MAX_SEARCH_DOCS", "500"))
 client = MongoClient(MONGO_URI)
 db = client[DB_NAME]
 collection = db[COLLECTION_NAME]
+
+# Connexion LECTURE-ÉCRITURE dédiée aux ÉTUDES utilisateur (le user principal de
+# l'API est en lecture seule). MONGO_URI_RW = chaîne d'un utilisateur RW ; si absent,
+# la fonctionnalité « études » est désactivée proprement (le POC bascule en local).
+_MONGO_URI_RW = os.getenv("MONGO_URI_RW")
+studies_col = None
+if _MONGO_URI_RW:
+    try:
+        studies_col = MongoClient(_MONGO_URI_RW)[DB_NAME]["hivescan_studies"]
+        studies_col.create_index("email")
+    except Exception:
+        studies_col = None
 
 # --- Décomposition du score d'innovation (traçabilité, cf. thèse Ch. 8) ---------
 # Les 5 features "plus = mieux" qui composent innovation_index (l'âge est un
