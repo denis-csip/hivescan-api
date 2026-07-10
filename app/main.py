@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi_pagination import Page, add_pagination, paginate
 from pymongo import MongoClient
 from typing import Optional, List
@@ -23,6 +24,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 add_pagination(app)
+
+# --- Gate « mot de passe partagé » pour les invités -------------------------------
+# Protège les endpoints de données (donc les quotas Lens/OpenAlex) : chaque requête
+# doit porter la clé partagée (header X-Access-Key ou ?key=). Définie via l'env
+# ACCESS_KEY en prod ; si ACCESS_KEY est absent (dev local), aucune restriction.
+# La racine "/" et le preflight CORS (OPTIONS) restent libres.
+ACCESS_KEY = os.getenv("ACCESS_KEY")
+_OPEN_PATHS = {"/", "/docs", "/openapi.json", "/redoc"}
+
+@app.middleware("http")
+async def _access_gate(request, call_next):
+    if ACCESS_KEY and request.method != "OPTIONS" and request.url.path not in _OPEN_PATHS:
+        supplied = request.headers.get("x-access-key") or request.query_params.get("key")
+        if supplied != ACCESS_KEY:
+            return JSONResponse({"detail": "Clé d'accès requise ou invalide."}, status_code=401)
+    return await call_next(request)
 
 # MongoDB : URI depuis l'env (prod) ; sinon fichier local NON commité (dev).
 # Aucun secret en dur dans le code.
