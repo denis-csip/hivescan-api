@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi_pagination import Page, add_pagination, paginate
@@ -8,28 +8,105 @@ from collections import Counter
 import re
 import os
 import json
+import time
+import hmac
+import hashlib
+import base64
 import unicodedata
 import urllib.request
 import urllib.parse
+import urllib.error
 
 app = FastAPI()
 add_pagination(app)
 
-# --- Gate « mot de passe partagé » pour les invités (défini AVANT le CORS) ---------
-# Protège les endpoints de données (donc les quotas Lens/OpenAlex) : chaque requête
-# doit porter la clé partagée (header X-Access-Key ou ?key=). Définie via l'env
-# ACCESS_KEY en prod ; si ACCESS_KEY est absent (dev local), aucune restriction.
-# La racine "/" et le preflight CORS (OPTIONS) restent libres.
+# --- Authentification (défini AVANT le CORS pour que les 401 aient les en-têtes CORS) ---
+# Deux mécanismes, activables par variables d'env :
+#   • Login IDEAS (comme ARIZ-Copilot) : SESSION_SECRET défini -> l'endpoint
+#     /ideas-login valide les identifiants IDEAS (API GraphQL) et émet un JETON
+#     de session signé (HMAC, sans état). Le client le renvoie en Bearer.
+#   • Clé partagée simple : ACCESS_KEY défini -> header X-Access-Key ou ?key=.
+# Si AUCUN des deux n'est défini (dev local) -> aucune restriction.
 ACCESS_KEY = os.getenv("ACCESS_KEY")
-_OPEN_PATHS = {"/", "/docs", "/openapi.json", "/redoc"}
+SESSION_SECRET = os.getenv("SESSION_SECRET")
+IDEAS_APP = os.getenv("IDEAS_APP", "ARIZ-Copilot")               # x-application accepté par IDEAS
+IDEAS_ENDPOINT = os.getenv("IDEAS_ENDPOINT", "https://ideas.aiard.eu/api")
+_AUTH_REQUIRED = bool(ACCESS_KEY or SESSION_SECRET)
+_OPEN_PATHS = {"/", "/docs", "/openapi.json", "/redoc", "/ideas-login", "/auth-status"}
+
+def _b64u(b):
+    return base64.urlsafe_b64encode(b).decode().rstrip("=")
+
+def _b64u_dec(s):
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+def _make_token(email, days=7):
+    payload = _b64u(json.dumps({"email": email, "exp": int(time.time()) + days * 86400}).encode())
+    sig = _b64u(hmac.new(SESSION_SECRET.encode(), payload.encode(), hashlib.sha256).digest())
+    return f"{payload}.{sig}"
+
+def _verify_token(tok):
+    if not (SESSION_SECRET and tok and "." in tok):
+        return None
+    payload, sig = tok.rsplit(".", 1)
+    expect = _b64u(hmac.new(SESSION_SECRET.encode(), payload.encode(), hashlib.sha256).digest())
+    if not hmac.compare_digest(sig, expect):
+        return None
+    try:
+        data = json.loads(_b64u_dec(payload))
+    except Exception:
+        return None
+    return data if data.get("exp", 0) >= time.time() else None
 
 @app.middleware("http")
 async def _access_gate(request, call_next):
-    if ACCESS_KEY and request.method != "OPTIONS" and request.url.path not in _OPEN_PATHS:
-        supplied = request.headers.get("x-access-key") or request.query_params.get("key")
-        if supplied != ACCESS_KEY:
-            return JSONResponse({"detail": "Clé d'accès requise ou invalide."}, status_code=401)
+    if _AUTH_REQUIRED and request.method != "OPTIONS" and request.url.path not in _OPEN_PATHS:
+        auth = request.headers.get("authorization") or ""
+        tok = auth[7:] if auth[:7].lower() == "bearer " else (
+            request.headers.get("x-access-key") or request.query_params.get("key"))
+        ok = bool(tok) and ((ACCESS_KEY and tok == ACCESS_KEY) or _verify_token(tok) is not None)
+        if not ok:
+            return JSONResponse({"detail": "Authentification requise."}, status_code=401)
     return await call_next(request)
+
+def _ideas_signin(email, password):
+    """Valide les identifiants auprès de l'API GraphQL IDEAS (repris d'ARIZ-Copilot)."""
+    esc = lambda s: s.replace("\\", "\\\\").replace('"', '\\"')
+    mutation = ('mutation { signin(email: "%s", password: "%s") '
+                '{ id name email token } }' % (esc(email), esc(password)))
+    body = json.dumps({"query": mutation}).encode()
+    req = urllib.request.Request(
+        IDEAS_ENDPOINT, data=body, method="POST",
+        headers={"Content-Type": "application/json", "x-application": IDEAS_APP})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            j = json.load(r)
+    except Exception:
+        return None, "network"
+    if j.get("errors"):
+        return None, (j["errors"][0] or {}).get("message", "auth")
+    u = (j.get("data") or {}).get("signin")
+    return (u, None) if u else (None, "invalid")
+
+@app.get("/auth-status")
+def auth_status():
+    """Le POC interroge cet endpoint (ouvert) pour savoir s'il doit afficher le login."""
+    return {"login_required": _AUTH_REQUIRED, "ideas": bool(SESSION_SECRET)}
+
+@app.post("/ideas-login")
+async def ideas_login(request: Request):
+    body = await request.json()
+    email = (body.get("email") or "").strip()
+    password = body.get("password") or ""
+    if not email or not password:
+        raise HTTPException(status_code=400, detail="Email et mot de passe requis.")
+    if not SESSION_SECRET:
+        raise HTTPException(status_code=503, detail="Login IDEAS non configuré (SESSION_SECRET absent).")
+    u, err = _ideas_signin(email, password)
+    if err or not u:
+        raise HTTPException(status_code=401, detail="Identifiants IDEAS invalides.")
+    return {"token": _make_token(u.get("email") or email),
+            "name": u.get("name"), "email": u.get("email") or email}
 
 # --- CORS : ajouté EN DERNIER = middleware le plus EXTERNE, pour que ses en-têtes
 # s'appliquent AUSSI aux réponses 401 du gate (sinon le navigateur bloque la lecture
@@ -39,7 +116,7 @@ _allow_origins = ["*"] if _origins_env == "*" else [o.strip() for o in _origins_
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allow_origins,
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST", "OPTIONS"],   # POST requis pour /ideas-login
     allow_headers=["*"],
 )
 
