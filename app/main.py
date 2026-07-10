@@ -34,7 +34,7 @@ SESSION_SECRET = os.getenv("SESSION_SECRET")
 IDEAS_APP = os.getenv("IDEAS_APP", "ARIZ-Copilot")               # x-application accepté par IDEAS
 IDEAS_ENDPOINT = os.getenv("IDEAS_ENDPOINT", "https://ideas.aiard.eu/api")
 _AUTH_REQUIRED = bool(ACCESS_KEY or SESSION_SECRET)
-_OPEN_PATHS = {"/", "/docs", "/openapi.json", "/redoc", "/ideas-login", "/auth-status"}
+_OPEN_PATHS = {"/", "/docs", "/openapi.json", "/redoc", "/ideas-login", "/auth-status", "/funding-coverage"}
 
 def _b64u(b):
     return base64.urlsafe_b64encode(b).decode().rstrip("=")
@@ -654,6 +654,18 @@ def funding_signal(f):
     equity = 0.0 if sa <= 0 else min(1.0, 0.55 + 0.18 * (sa - 1))
     debt = 0.30 if f.get("has_charges") else 0.0     # dette garantie = financement obtenu (GB)
     return round(min(1.0, equity + (0 if equity == 0 else debt * 0.5) + (debt if equity == 0 else 0)), 3)
+
+@app.get("/funding-coverage")
+def funding_coverage():
+    """Couverture financement par pays (ouvert) : nb enrichies / trouvées / avec levée."""
+    out = {}
+    for jur, (path, source) in _FUNDING_FILES.items():
+        data = _load_funding_file(path)
+        found = [v for v in data.values() if isinstance(v, dict) and v.get("found")]
+        raises = [v for v in found if v.get("share_allotments")]
+        out[jur] = {"source": source, "enriched": len(data), "found": len(found),
+                    "with_raise": len(raises)}
+    return out
 
 @app.get("/company-funding")
 def company_funding(name: str = Query(...)):
