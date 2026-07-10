@@ -126,7 +126,8 @@ def _study_public(d):
     return {"id": d.get("sid"), "name": d.get("name"), "query": d.get("query") or [],
             "jurisdiction": d.get("jurisdiction"), "innovation_min": d.get("innovation_min"),
             "result_count": d.get("result_count"), "category_id": d.get("category_id"),
-            "position": d.get("position", 0), "created": d.get("created"), "updated": d.get("updated")}
+            "position": d.get("position", 0), "has_results": bool(d.get("results")),
+            "created": d.get("created"), "updated": d.get("updated")}
 
 @app.get("/studies")
 def list_studies(request: Request):
@@ -157,8 +158,30 @@ async def save_study(request: Request):
            "category_id": body.get("category_id"),
            "position": -time.time(),     # nouveau = en tête (tri par position ascendant)
            "created": now, "updated": now}
+    # Snapshot des résultats (pour consultation instantanée sans re-run) — borné à
+    # 60 entreprises + garde-fou taille (limite doc Mongo 16 Mo).
+    results = body.get("results")
+    if isinstance(results, list) and results:
+        snap = results[:60]
+        try:
+            if len(json.dumps(snap)) < 9_000_000:
+                doc["results"] = snap
+        except Exception:
+            pass
     studies_col.insert_one(dict(doc))
     return _study_public(doc)
+
+@app.get("/studies/{sid}")
+def get_study(sid: str, request: Request):
+    email = _current_email(request)
+    if not email or studies_col is None:
+        raise HTTPException(status_code=401, detail="Non autorisé.")
+    d = studies_col.find_one({"sid": sid, "email": email}, {"_id": 0})
+    if not d:
+        raise HTTPException(status_code=404, detail="Étude introuvable.")
+    out = _study_public(d)
+    out["results"] = d.get("results")     # snapshot complet (peut être None)
+    return out
 
 @app.patch("/studies/{sid}")
 async def update_study(sid: str, request: Request):
