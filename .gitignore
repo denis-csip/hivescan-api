@@ -1,0 +1,14 @@
+# Secrets — NE JAMAIS committer
+mongo_uri.txt
+*clé*.txt
+*.key
+.env
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Divers
+*.db

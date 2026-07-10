@@ -1,0 +1,20 @@
+# Blueprint Render — déploie l'API Hivescan (FastAPI + Docker).
+# Import : Render Dashboard > New > Blueprint > pointer sur ce dépôt.
+# Les secrets (sync:false) se saisissent dans le dashboard, JAMAIS ici.
+services:
+  - type: web
+    name: hivescan-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: free              # démarrage à froid ~50 s sur le plan gratuit ; passer à "starter" si besoin
+    healthCheckPath: /
+    envVars:
+      - key: MONGO_URI       # chaîne de connexion Atlas (utilisateur LECTURE SEULE recommandé)
+        sync: false
+      - key: LENS_KEY        # clé API Lens.org
+        sync: false
+      - key: OPENALEX_API_KEY
+        sync: false
+      - key: ALLOWED_ORIGINS # ex. https://hivescan.net,https://app.hivescan.net
+        sync: false

@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.db
+.env
+mongo_uri.txt
+*clé*.txt
+*.key
+enrich_*.py
+.git/
+.gitignore
