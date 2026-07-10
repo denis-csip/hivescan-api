@@ -125,14 +125,15 @@ def _current_email(request: Request):
 def _study_public(d):
     return {"id": d.get("sid"), "name": d.get("name"), "query": d.get("query") or [],
             "jurisdiction": d.get("jurisdiction"), "innovation_min": d.get("innovation_min"),
-            "result_count": d.get("result_count"), "created": d.get("created"), "updated": d.get("updated")}
+            "result_count": d.get("result_count"), "category_id": d.get("category_id"),
+            "position": d.get("position", 0), "created": d.get("created"), "updated": d.get("updated")}
 
 @app.get("/studies")
 def list_studies(request: Request):
     email = _current_email(request)
     if not email or studies_col is None:
         return {"studies": [], "storage": studies_col is not None}
-    docs = list(studies_col.find({"email": email}, {"_id": 0}).sort("updated", -1).limit(100))
+    docs = list(studies_col.find({"email": email}, {"_id": 0}).sort("position", 1).limit(300))
     return {"studies": [_study_public(d) for d in docs], "storage": True}
 
 @app.post("/studies")
@@ -153,9 +154,32 @@ async def save_study(request: Request):
            "jurisdiction": body.get("jurisdiction"),
            "innovation_min": body.get("innovation_min"),
            "result_count": body.get("result_count"),
+           "category_id": body.get("category_id"),
+           "position": -time.time(),     # nouveau = en tête (tri par position ascendant)
            "created": now, "updated": now}
     studies_col.insert_one(dict(doc))
     return _study_public(doc)
+
+@app.patch("/studies/{sid}")
+async def update_study(sid: str, request: Request):
+    email = _current_email(request)
+    if not email or studies_col is None:
+        raise HTTPException(status_code=401, detail="Non autorisé.")
+    body = await request.json()
+    patch = {}
+    if "name" in body:
+        patch["name"] = ((body.get("name") or "").strip()[:120]) or "Étude"
+    if "category_id" in body:
+        patch["category_id"] = body.get("category_id")
+    if "position" in body:
+        try:
+            patch["position"] = float(body.get("position"))
+        except (TypeError, ValueError):
+            pass
+    if patch:
+        patch["updated"] = datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        studies_col.update_one({"sid": sid, "email": email}, {"$set": patch})
+    return {"ok": True, "id": sid}
 
 @app.delete("/studies/{sid}")
 def delete_study(sid: str, request: Request):
@@ -166,6 +190,62 @@ def delete_study(sid: str, request: Request):
         studies_col.delete_one({"sid": sid, "email": email})
     return {"deleted": sid}
 
+# --- Dossiers / catégories d'études (par utilisateur, façon ARIZ-Copilot) ----------
+def _cat_public(d):
+    return {"id": d.get("cid"), "name": d.get("name"), "color": d.get("color") or "blue",
+            "position": d.get("position", 0)}
+
+@app.get("/categories")
+def list_categories(request: Request):
+    email = _current_email(request)
+    if not email or categories_col is None:
+        return {"categories": []}
+    docs = list(categories_col.find({"email": email}, {"_id": 0}).sort("position", 1).limit(60))
+    return {"categories": [_cat_public(d) for d in docs]}
+
+@app.post("/categories")
+async def create_category(request: Request):
+    email = _current_email(request)
+    if not email or categories_col is None:
+        raise HTTPException(status_code=503, detail="Stockage non configuré (MONGO_URI_RW).")
+    body = await request.json()
+    doc = {"cid": uuid.uuid4().hex, "email": email,
+           "name": (body.get("name") or "Dossier").strip()[:60],
+           "color": body.get("color") or "blue", "position": time.time()}
+    categories_col.insert_one(dict(doc))
+    return _cat_public(doc)
+
+@app.patch("/categories/{cid}")
+async def update_category(cid: str, request: Request):
+    email = _current_email(request)
+    if not email or categories_col is None:
+        raise HTTPException(status_code=401, detail="Non autorisé.")
+    body = await request.json()
+    patch = {}
+    if "name" in body:
+        patch["name"] = ((body.get("name") or "").strip()[:60]) or "Dossier"
+    if "color" in body:
+        patch["color"] = body.get("color")
+    if "position" in body:
+        try:
+            patch["position"] = float(body.get("position"))
+        except (TypeError, ValueError):
+            pass
+    if patch:
+        categories_col.update_one({"cid": cid, "email": email}, {"$set": patch})
+    return {"ok": True, "id": cid}
+
+@app.delete("/categories/{cid}")
+def delete_category(cid: str, request: Request):
+    email = _current_email(request)
+    if not email:
+        raise HTTPException(status_code=401, detail="Non authentifié.")
+    if categories_col is not None:
+        categories_col.delete_one({"cid": cid, "email": email})
+        if studies_col is not None:      # les études du dossier repassent « sans dossier »
+            studies_col.update_many({"email": email, "category_id": cid}, {"$set": {"category_id": None}})
+    return {"deleted": cid}
+
 # --- CORS : ajouté EN DERNIER = middleware le plus EXTERNE, pour que ses en-têtes
 # s'appliquent AUSSI aux réponses 401 du gate (sinon le navigateur bloque la lecture
 # de la réponse). En prod, définir ALLOWED_ORIGINS = le(s) domaine(s) du POC.
@@ -174,7 +254,7 @@ _allow_origins = ["*"] if _origins_env == "*" else [o.strip() for o in _origins_
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allow_origins,
-    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],   # POST=login, DELETE=études
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],   # POST=login, PATCH/DELETE=études/dossiers
     allow_headers=["*"],
 )
 
@@ -206,12 +286,14 @@ collection = db[COLLECTION_NAME]
 # la fonctionnalité « études » est désactivée proprement (le POC bascule en local).
 _MONGO_URI_RW = os.getenv("MONGO_URI_RW")
 studies_col = None
+categories_col = None
 if _MONGO_URI_RW:
     try:
-        studies_col = MongoClient(_MONGO_URI_RW)[DB_NAME]["hivescan_studies"]
-        studies_col.create_index("email")
+        _rwdb = MongoClient(_MONGO_URI_RW)[DB_NAME]
+        studies_col = _rwdb["hivescan_studies"]; studies_col.create_index("email")
+        categories_col = _rwdb["hivescan_categories"]; categories_col.create_index("email")
     except Exception:
-        studies_col = None
+        studies_col = None; categories_col = None
 
 # --- Décomposition du score d'innovation (traçabilité, cf. thèse Ch. 8) ---------
 # Les 5 features "plus = mieux" qui composent innovation_index (l'âge est un
