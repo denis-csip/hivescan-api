@@ -39,6 +39,9 @@ def _load_mongo_uri():
 MONGO_URI = _load_mongo_uri()
 DB_NAME = os.getenv("MONGO_DB", "hivescan_data")
 COLLECTION_NAME = os.getenv("MONGO_COLLECTION", "data")
+# Borne mémoire de /search : nb max de documents complets chargés (évite l'OOM en
+# prod quand un mot-clé large matche des milliers d'entreprises). Configurable.
+MAX_SEARCH_DOCS = int(os.getenv("MAX_SEARCH_DOCS", "500"))
 
 client = MongoClient(MONGO_URI)
 db = client[DB_NAME]
@@ -687,30 +690,35 @@ def search(
 
     mongo_query = {"$and": filters} if filters else {}
 
-
-    pipeline = [{"$match":mongo_query}]
-
-    #need to add a way to add asc et desc to filter for articles
-    
-     
+    # Classement + borne mémoire, en DEUX temps (Atlas M0 : tri bloquant limité à
+    # 32 Mo, sans allowDiskUse -> impossible de trier des documents lourds).
+    #   1) requête LÉGÈRE projetée (nom + champ de tri) -> tri + limite peu coûteux.
+    #   2) on ne charge les documents COMPLETS que pour les MAX_SEARCH_DOCS meilleurs.
     if sort:
         try:
             field, direction = sort.split(":")
-            direction = direction.lower().strip()
-            order = 1 if direction == "asc" else -1
-            pipeline.append({"$sort": {field: order}})
+            order = 1 if direction.lower().strip() == "asc" else -1
         except ValueError:
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid sort format. Use field:asc or field:desc"
-            )
-    
-    
-    
-    pipeline.append({"$project": {"_id": 0}})
-    
+            raise HTTPException(status_code=400,
+                                detail="Invalid sort format. Use field:asc or field:desc")
+        rank_field = field
+    else:
+        rank_field, order = "innovation_index", -1
 
-    results = list(collection.aggregate(pipeline))
+    ranked = list(collection.aggregate([
+        {"$match": mongo_query},
+        {"$project": {"_id": 0, "results_company_name": 1, rank_field: 1}},
+        {"$sort": {rank_field: order}},
+        {"$limit": MAX_SEARCH_DOCS},
+    ]))
+    names = [r.get("results_company_name") for r in ranked if r.get("results_company_name")]
+    if not names:
+        raise HTTPException(status_code=404, detail="No documents matched your query")
+
+    full_by_name = {d["results_company_name"]: d
+                    for d in collection.find({"results_company_name": {"$in": names}}, {"_id": 0})}
+    # On respecte l'ordre du classement (phase 1).
+    results = [full_by_name[n] for n in names if n in full_by_name]
     
     #!!!!!!!!!!!!!!!!!!!!!!!
     #rebuild and test if this only gets the corresponding articles
