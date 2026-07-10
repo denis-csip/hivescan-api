@@ -13,19 +13,9 @@ import urllib.request
 import urllib.parse
 
 app = FastAPI()
-# CORS : par défaut ouvert (dev local) ; en prod, définir ALLOWED_ORIGINS = le(s)
-# domaine(s) du POC (ex. "https://hivescan.net,https://app.hivescan.net").
-_origins_env = os.getenv("ALLOWED_ORIGINS", "*").strip()
-_allow_origins = ["*"] if _origins_env == "*" else [o.strip() for o in _origins_env.split(",") if o.strip()]
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_allow_origins,
-    allow_methods=["GET"],
-    allow_headers=["*"],
-)
 add_pagination(app)
 
-# --- Gate « mot de passe partagé » pour les invités -------------------------------
+# --- Gate « mot de passe partagé » pour les invités (défini AVANT le CORS) ---------
 # Protège les endpoints de données (donc les quotas Lens/OpenAlex) : chaque requête
 # doit porter la clé partagée (header X-Access-Key ou ?key=). Définie via l'env
 # ACCESS_KEY en prod ; si ACCESS_KEY est absent (dev local), aucune restriction.
@@ -40,6 +30,18 @@ async def _access_gate(request, call_next):
         if supplied != ACCESS_KEY:
             return JSONResponse({"detail": "Clé d'accès requise ou invalide."}, status_code=401)
     return await call_next(request)
+
+# --- CORS : ajouté EN DERNIER = middleware le plus EXTERNE, pour que ses en-têtes
+# s'appliquent AUSSI aux réponses 401 du gate (sinon le navigateur bloque la lecture
+# de la réponse). En prod, définir ALLOWED_ORIGINS = le(s) domaine(s) du POC.
+_origins_env = os.getenv("ALLOWED_ORIGINS", "*").strip()
+_allow_origins = ["*"] if _origins_env == "*" else [o.strip() for o in _origins_env.split(",") if o.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_allow_origins,
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
 
 # MongoDB : URI depuis l'env (prod) ; sinon fichier local NON commité (dev).
 # Aucun secret en dur dans le code.
