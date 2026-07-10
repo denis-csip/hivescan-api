@@ -9,7 +9,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app/ ./
 
 # Données de financement (santé/levées) enrichies hors ligne — embarquées dans l'image.
-COPY funding_ch.json funding_fr.json funding_no.json funding_dk.json ./
+COPY funding_ch.json funding_fr.json funding_no.json funding_dk.json funding_us.json ./
 ENV FUNDING_DIR=/app
 
 EXPOSE 8000

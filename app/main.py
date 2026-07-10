@@ -607,6 +607,7 @@ _FUNDING_FILES = {
     "fr": (os.path.join(_FUNDING_DIR, "funding_fr.json"), "BODACC + Recherche d'entreprises"),
     "no": (os.path.join(_FUNDING_DIR, "funding_no.json"), "Brønnøysundregistrene"),
     "dk": (os.path.join(_FUNDING_DIR, "funding_dk.json"), "CVR (Danemark)"),
+    "us_ri": (os.path.join(_FUNDING_DIR, "funding_us.json"), "SEC EDGAR — Form D"),
 }
 _FR_JURS = {"fr", "re", "gp", "mq", "gf"}          # France métropole + DOM (SIREN INPI)
 # Pays où seule la SANTÉ (statut/âge/faillite) est dispo librement — pas les levées.
@@ -643,6 +644,8 @@ def _funding_key(doc, jur):
         return num if len(num) == 9 else None
     if jur == "dk":                                 # CVR 8 chiffres
         return num if len(num) == 8 else None
+    if jur == "us_ri":                              # identifiant registre RI (numérique)
+        return num or None
     return None
 
 def funding_signal(f):
