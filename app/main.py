@@ -1372,6 +1372,15 @@ def topic_search(topic_id: int = Query(..., description="Topic (0–29) à explo
         if isinstance(ec, float) and ec != ec:
             doc["employee_count"] = None
         doc["score_breakdown"] = score_breakdown(doc, ctx["fmax"])
+        # On ne garde QUE les articles DU TOPIC (comme /search pour les mots-clés). Sinon le
+        # payload = docs complets = ~17 Mo pour 60 entreprises très publiantes -> OOM/timeout
+        # Render. Ici ~1,3 Mo, et ça montre POURQUOI l'entreprise relève du topic.
+        arts = [p for p in doc.get("possible_triz_levels", [])
+                if any(isinstance(t, list) and t and t[0] == topic_id
+                       for t in (p.get("top_3_topic_probs") or []))]
+        arts.sort(key=lambda p: p.get("citationCount") or 0, reverse=True)
+        doc["possible_triz_levels"] = arts[:20]
+        doc["matched_article_count"] = len(arts)
     results.sort(key=lambda d: d.get("innovation_index") or 0, reverse=True)
     return {"items": results, "total": total, "topic_id": topic_id, "topic_label": TOPIC_LABELS.get(topic_id)}
 
