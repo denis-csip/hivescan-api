@@ -507,11 +507,13 @@ def domain_meta(domain: str = Query(None)):
 # L'admin place chaque terme au numérateur (bénéfice, I↑) ou dénominateur (coût, I↓)
 # avec un coefficient. I = moyenne_pondérée(num) / (1 + moyenne_pondérée(den)).
 DEFAULT_IDEALITY = {"terms": [
-    {"key": "solving",    "label": "Problème-solving", "side": "num", "coef": 1.0},
-    {"key": "impact",     "label": "Impact",           "side": "num", "coef": 1.0},
-    {"key": "production",  "label": "Production",       "side": "num", "coef": 1.0},
-    {"key": "human",       "label": "Capital humain",   "side": "num", "coef": 1.0},
-    {"key": "context",     "label": "Contexte",         "side": "num", "coef": 1.0},
+    {"key": "solving",    "label": "Problème-solving",   "side": "num", "coef": 1.0},
+    {"key": "impact",     "label": "Impact",             "side": "num", "coef": 1.0},
+    {"key": "production",  "label": "Production",         "side": "num", "coef": 1.0},
+    {"key": "human",       "label": "Capital humain",     "side": "num", "coef": 1.0},
+    {"key": "context",     "label": "Contexte",           "side": "num", "coef": 1.0},
+    {"key": "patents",     "label": "Quantité de brevets", "side": "num", "coef": 1.0},
+    {"key": "funding",     "label": "Levée de fonds",      "side": "num", "coef": 1.0},
 ]}
 
 def _current_admin(request: Request):
