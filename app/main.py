@@ -1318,10 +1318,62 @@ def search(
         matches.sort(key=lambda x: x["score"], reverse=True)
         return paginate(matches)
     
-    if not results: 
+    if not results:
         raise HTTPException(status_code=404, detail="No documents matched your query")
-    
+
     return paginate(results)
+
+@app.get("/topic-search")
+def topic_search(topic_id: int = Query(..., description="Topic (0–29) à explorer — découverte topic-first, sans mot-clé"),
+                 domain: Optional[str] = Query(None),
+                 jurisdiction: Optional[str] = Query(None),
+                 keywords: Optional[List[str]] = Query(None, description="Optionnel : combine topic ∩ mot-clé"),
+                 innovation_min: Optional[float] = Query(None, ge=0.0, le=1.0),
+                 size: int = Query(60, ge=1, le=200)):
+    """Découverte TOPIC-FIRST (thèse) : renvoie les ENTREPRISES dont ≥1 article relève du
+    topic choisi (sortie du topic-modeling LDA/ETM), classées par innovation_index, enrichies
+    (radar + décomposition) comme /search — donc affichables tel quel dans la table du POC.
+    Combinable avec mot-clé/juridiction/innovation_min. `total` = compte réel du topic."""
+    ctx = _domain_ctx(domain)
+    coll = ctx["coll"]
+    # Un article a top_3_topic_probs = [[id, prob], …] ; on matche une paire dont l'index 0 == topic_id.
+    filters = [{"possible_triz_levels": {"$elemMatch": {"top_3_topic_probs": {"$elemMatch": {"0": topic_id}}}}}]
+    if jurisdiction:
+        countries = [j.strip().lower() for j in jurisdiction.split(",") if j.strip()]
+        if countries:
+            filters.append({"results_company_jurisdiction_code": {"$in": countries}})
+    if keywords:
+        kf = []
+        for kw in keywords:
+            kwr = {"$regex": re.escape(kw), "$options": "i"}
+            kf.append({"possible_triz_levels.title": kwr})
+            kf.append({"possible_triz_levels.abstract": kwr})
+        filters.append({"$or": kf})
+    if innovation_min is not None:
+        filters.append({"innovation_index": {"$gte": innovation_min}})
+    q = {"$and": filters}
+    total = coll.count_documents(q)
+    if not total:
+        return {"items": [], "total": 0, "topic_id": topic_id, "topic_label": TOPIC_LABELS.get(topic_id)}
+    # Deux temps (Atlas M0) : classement léger projeté -> top `size`, puis docs complets.
+    ranked = list(coll.aggregate([
+        {"$match": q},
+        {"$project": {"_id": 0, "results_company_name": 1, "innovation_index": 1}},
+        {"$sort": {"innovation_index": -1}},
+        {"$limit": size},
+    ]))
+    names = [r.get("results_company_name") for r in ranked if r.get("results_company_name")]
+    full_by_name = {d["results_company_name"]: d
+                    for d in coll.find({"results_company_name": {"$in": names}}, {"_id": 0})}
+    results = [full_by_name[n] for n in names if n in full_by_name]
+    for doc in results:
+        doc["radar"] = company_radar(doc, ctx["fmax"])
+        ec = doc.get("employee_count")
+        if isinstance(ec, float) and ec != ec:
+            doc["employee_count"] = None
+        doc["score_breakdown"] = score_breakdown(doc, ctx["fmax"])
+    results.sort(key=lambda d: d.get("innovation_index") or 0, reverse=True)
+    return {"items": results, "total": total, "topic_id": topic_id, "topic_label": TOPIC_LABELS.get(topic_id)}
 
 
 
