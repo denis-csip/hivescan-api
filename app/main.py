@@ -502,18 +502,19 @@ def domain_meta(domain: str = Query(None)):
     return {"domain": ctx["domain"], "pop_radar": ctx["pop"],
             "feature_max": ctx["fmax"], "topic_labels": TOPIC_LABELS}
 
-# --- Formule d'idéalité (I) : éditable par l'admin ; corrèle le calcul de l'indice ---
-# Termes = les 5 axes du radar (valeurs déjà normalisées 0–1, propres au domaine).
-# L'admin place chaque terme au numérateur (bénéfice, I↑) ou dénominateur (coût, I↓)
-# avec un coefficient. I = moyenne_pondérée(num) / (1 + moyenne_pondérée(den)).
+# --- Inventive Confidence Index (ICI) : 7 sous-indices, éditable par l'admin --------
+# Uniquement des signaux publics/objectifs/reproductibles (cf. thèse Connor). Chaque
+# sous-indice est normalisé 0–1 (affiché 0–100). ICI = moyenne pondérée des termes
+# DISPONIBLES ; un terme peut passer en dénominateur (pénalité). Poids par défaut =
+# priorité à la solidité inventive (PS/SP/HC/PP) sur les validations externes (IM/FP/EC).
 DEFAULT_IDEALITY = {"terms": [
-    {"key": "solving",    "label": "Problème-solving",   "side": "num", "coef": 1.0},
-    {"key": "impact",     "label": "Impact",             "side": "num", "coef": 1.0},
-    {"key": "production",  "label": "Production",         "side": "num", "coef": 1.0},
-    {"key": "human",       "label": "Capital humain",     "side": "num", "coef": 1.0},
-    {"key": "context",     "label": "Contexte",           "side": "num", "coef": 1.0},
-    {"key": "patents",     "label": "Quantité de brevets", "side": "num", "coef": 1.0},
-    {"key": "funding",     "label": "Levée de fonds",      "side": "num", "coef": 1.0},
+    {"key": "solving",    "code": "PS", "label": "Problem Solving",        "side": "num", "coef": 30},
+    {"key": "production", "code": "SP", "label": "Scientific Production",   "side": "num", "coef": 20},
+    {"key": "human",      "code": "HC", "label": "Human Capital",          "side": "num", "coef": 15},
+    {"key": "patents",    "code": "PP", "label": "Patent Performance",     "side": "num", "coef": 15},
+    {"key": "impact",     "code": "IM", "label": "Impact",                 "side": "num", "coef": 10},
+    {"key": "funding",    "code": "FP", "label": "Funding Performance",    "side": "num", "coef": 5},
+    {"key": "context",    "code": "EC", "label": "Ecosystem Context",      "side": "num", "coef": 5},
 ]}
 
 def _current_admin(request: Request):
@@ -548,10 +549,11 @@ async def save_ideality(request: Request, domain: str = Query(None)):
         if not isinstance(t, dict) or not t.get("key"):
             continue
         try:
-            coef = max(0.0, min(5.0, float(t.get("coef", 1))))
+            coef = max(0.0, min(100.0, float(t.get("coef", 1))))
         except (TypeError, ValueError):
             coef = 1.0
-        clean.append({"key": str(t["key"]), "label": str(t.get("label", t["key"]))[:40],
+        clean.append({"key": str(t["key"]), "code": str(t.get("code", ""))[:6],
+                      "label": str(t.get("label", t["key"]))[:40],
                       "side": "den" if t.get("side") == "den" else "num", "coef": round(coef, 2)})
     config_col.update_one({"_id": f"ideality:{dom}"},
                           {"$set": {"terms": clean, "domain": dom}}, upsert=True)
