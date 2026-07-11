@@ -480,7 +480,7 @@ TOPIC_LABELS = {
 
 @app.get("/")
 def root():
-    return {"message": "Search API is running", "feature_max": FEATURE_MAX,
+    return {"message": "Search API is running", "build": "topic-trim-1", "feature_max": FEATURE_MAX,
             "pop_radar": POP_RADAR, "topic_labels": TOPIC_LABELS, "lens": bool(LENS_KEY)}
 
 @app.get("/domains")
