@@ -31,6 +31,11 @@ add_pagination(app)
 # Si AUCUN des deux n'est défini (dev local) -> aucune restriction.
 ACCESS_KEY = os.getenv("ACCESS_KEY")
 SESSION_SECRET = os.getenv("SESSION_SECRET")
+# Admins (allowlist d'emails) : peuvent éditer la formule d'idéalité. Denis par défaut.
+ADMIN_EMAILS = {e.strip().lower() for e in os.getenv(
+    "ADMIN_EMAILS", "denis.cavallucci@insa-strasbourg.fr").split(",") if e.strip()}
+def _is_admin(email):
+    return bool(email) and email.strip().lower() in ADMIN_EMAILS
 IDEAS_APP = os.getenv("IDEAS_APP", "ARIZ-Copilot")               # x-application accepté par IDEAS
 IDEAS_ENDPOINT = os.getenv("IDEAS_ENDPOINT", "https://ideas.aiard.eu/api")
 _AUTH_REQUIRED = bool(ACCESS_KEY or SESSION_SECRET)
@@ -43,8 +48,9 @@ def _b64u(b):
 def _b64u_dec(s):
     return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
 
-def _make_token(email, days=7):
-    payload = _b64u(json.dumps({"email": email, "exp": int(time.time()) + days * 86400}).encode())
+def _make_token(email, admin=False, days=7):
+    payload = _b64u(json.dumps({"email": email, "admin": bool(admin),
+                                "exp": int(time.time()) + days * 86400}).encode())
     sig = _b64u(hmac.new(SESSION_SECRET.encode(), payload.encode(), hashlib.sha256).digest())
     return f"{payload}.{sig}"
 
@@ -111,8 +117,10 @@ async def ideas_login(request: Request):
     if err or not u:
         raise HTTPException(status_code=401, detail="Identifiants IDEAS invalides.")
     orgs = [o.get("name") for o in (u.get("organizations") or []) if o.get("name")]
-    return {"token": _make_token(u.get("email") or email),
-            "name": u.get("name"), "email": u.get("email") or email,
+    mail = u.get("email") or email
+    admin = _is_admin(mail)
+    return {"token": _make_token(mail, admin),
+            "name": u.get("name"), "email": mail, "is_admin": admin,
             "avatar": u.get("avatar"), "job": u.get("job"), "organizations": orgs}
 
 # --- Études sauvegardées par utilisateur (persistance façon ARIZ-Copilot) ----------
@@ -313,13 +321,15 @@ collection = db[COLLECTION_NAME]
 _MONGO_URI_RW = os.getenv("MONGO_URI_RW")
 studies_col = None
 categories_col = None
+config_col = None
 if _MONGO_URI_RW:
     try:
         _rwdb = MongoClient(_MONGO_URI_RW)[DB_NAME]
         studies_col = _rwdb["hivescan_studies"]; studies_col.create_index("email")
         categories_col = _rwdb["hivescan_categories"]; categories_col.create_index("email")
+        config_col = _rwdb["hivescan_config"]     # ex. formule d'idéalité (par domaine)
     except Exception:
-        studies_col = None; categories_col = None
+        studies_col = None; categories_col = None; config_col = None
 
 # --- Décomposition du score d'innovation (traçabilité, cf. thèse Ch. 8) ---------
 # Les 5 features "plus = mieux" qui composent innovation_index (l'âge est un
@@ -486,6 +496,64 @@ def domain_meta(domain: str = Query(None)):
     ctx = _domain_ctx(domain)
     return {"domain": ctx["domain"], "pop_radar": ctx["pop"],
             "feature_max": ctx["fmax"], "topic_labels": TOPIC_LABELS}
+
+# --- Formule d'idéalité (I) : éditable par l'admin ; corrèle le calcul de l'indice ---
+# Termes = les 5 axes du radar (valeurs déjà normalisées 0–1, propres au domaine).
+# L'admin place chaque terme au numérateur (bénéfice, I↑) ou dénominateur (coût, I↓)
+# avec un coefficient. I = moyenne_pondérée(num) / (1 + moyenne_pondérée(den)).
+DEFAULT_IDEALITY = {"terms": [
+    {"key": "solving",    "label": "Problème-solving", "side": "num", "coef": 1.0},
+    {"key": "impact",     "label": "Impact",           "side": "num", "coef": 1.0},
+    {"key": "production",  "label": "Production",       "side": "num", "coef": 1.0},
+    {"key": "human",       "label": "Capital humain",   "side": "num", "coef": 1.0},
+    {"key": "context",     "label": "Contexte",         "side": "num", "coef": 1.0},
+]}
+
+def _current_admin(request: Request):
+    auth = request.headers.get("authorization") or ""
+    tok = auth[7:] if auth[:7].lower() == "bearer " else None
+    data = _verify_token(tok) if tok else None
+    return bool(data and data.get("admin"))
+
+@app.get("/ideality")
+def get_ideality(domain: str = Query(None)):
+    dom = domain if domain in DOMAINS else DEFAULT_DOMAIN
+    if config_col is not None:
+        d = config_col.find_one({"_id": f"ideality:{dom}"}, {"_id": 0})
+        if d and d.get("terms"):
+            return {"domain": dom, "terms": d["terms"], "custom": True}
+    return {"domain": dom, "terms": DEFAULT_IDEALITY["terms"], "custom": False}
+
+@app.post("/ideality")
+async def save_ideality(request: Request, domain: str = Query(None)):
+    if not _current_admin(request):
+        raise HTTPException(status_code=403, detail="Réservé aux administrateurs.")
+    if config_col is None:
+        raise HTTPException(status_code=503, detail="Stockage non configuré (MONGO_URI_RW).")
+    dom = domain if domain in DOMAINS else DEFAULT_DOMAIN
+    body = await request.json()
+    clean = []
+    for t in (body.get("terms") or []):
+        if not isinstance(t, dict) or not t.get("key"):
+            continue
+        try:
+            coef = max(0.0, min(5.0, float(t.get("coef", 1))))
+        except (TypeError, ValueError):
+            coef = 1.0
+        clean.append({"key": str(t["key"]), "label": str(t.get("label", t["key"]))[:40],
+                      "side": "den" if t.get("side") == "den" else "num", "coef": round(coef, 2)})
+    config_col.update_one({"_id": f"ideality:{dom}"},
+                          {"$set": {"terms": clean, "domain": dom}}, upsert=True)
+    return {"ok": True, "domain": dom, "terms": clean}
+
+@app.delete("/ideality")
+def reset_ideality(request: Request, domain: str = Query(None)):
+    if not _current_admin(request):
+        raise HTTPException(status_code=403, detail="Réservé aux administrateurs.")
+    dom = domain if domain in DOMAINS else DEFAULT_DOMAIN
+    if config_col is not None:
+        config_col.delete_one({"_id": f"ideality:{dom}"})
+    return {"ok": True, "domain": dom, "terms": DEFAULT_IDEALITY["terms"]}
 
 # --- Lens (brevets) : signal de crédibilité par entreprise ------------------
 # Une entreprise de la base qui détient des brevets = crédibilité renforcée pour
