@@ -607,6 +607,112 @@ def _lens_post(payload):
     with urllib.request.urlopen(req, timeout=40) as r:
         return json.load(r)
 
+# --- Désambiguïsation IA des brevets « à vérifier » (LLM peu gourmand) ------------
+# Un brevet au nom d'un homonyme même-pays, hors des mots-clés du domaine, est
+# « à vérifier » (risque d'homonyme). On demande à un LLM léger (Gemini 2.5 Flash-Lite,
+# ~10× moins cher que Haiku, même famille de clé qu'Inventioneering) de juger la
+# PROXIMITÉ THÉMATIQUE entre la classe technique du brevet (codes CPC en premier,
+# puis titre) et la typologie de la startup : une forte proximité rend probable
+# qu'il s'agit bien de la même personne (on brevète dans son domaine). Au-dessus d'un
+# seuil de confiance, le brevet est compté. Optionnel : inactif si GEMINI_API_KEY
+# absent (les brevets restent « à vérifier », comportement actuel). Sortie structurée
+# (responseSchema) → JSON validé, thinking désactivé. Cache par (entreprise, domaine).
+_GEMINI_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+_PATENT_LLM_MODEL = os.getenv("PATENT_LLM_MODEL", "gemini-2.5-flash-lite")
+try:
+    _PATENT_LLM_THRESHOLD = float(os.getenv("PATENT_LLM_THRESHOLD", "0.7"))
+except ValueError:
+    _PATENT_LLM_THRESHOLD = 0.7
+_llm_patent_cache = {}
+# Schéma Gemini (sous-ensemble OpenAPI : types en MAJUSCULES, pas d'additionalProperties).
+_PATENT_JUDGE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "startup_field": {"type": "STRING"},
+        "judgments": {"type": "ARRAY", "items": {
+            "type": "OBJECT",
+            "properties": {
+                "index": {"type": "INTEGER"},
+                "confidence": {"type": "NUMBER"},
+                "related": {"type": "BOOLEAN"},
+            },
+            "required": ["index", "confidence", "related"],
+        }},
+    },
+    "required": ["startup_field", "judgments"],
+}
+
+def _gemini_json(user, schema, max_tokens=1024):
+    """Appel Gemini generateContent (urllib, comme Lens) en sortie JSON structurée. Retourne le dict."""
+    body = {
+        "contents": [{"parts": [{"text": user}]}],
+        "generationConfig": {
+            "temperature": 0,
+            "responseMimeType": "application/json",
+            "responseSchema": schema,
+            "maxOutputTokens": max_tokens,
+            "thinkingConfig": {"thinkingBudget": 0},   # pas de raisonnement -> tokens minimaux
+        },
+    }
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{_PATENT_LLM_MODEL}:generateContent"
+    req = urllib.request.Request(
+        url, data=json.dumps(body).encode("utf-8"),
+        headers={"x-goog-api-key": _GEMINI_KEY, "Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as r:
+        resp = json.load(r)
+    cands = resp.get("candidates") or []
+    if not cands:
+        return None
+    parts = ((cands[0].get("content") or {}).get("parts")) or []
+    txt = next((p.get("text") for p in parts if p.get("text")), None)
+    return json.loads(txt) if txt else None
+
+def _llm_confirm_patents(name, dom, broad):
+    """broad = [{title, abstract, cpc}]. Retourne {confirmed, field, ok_titles} (proximité≥seuil)."""
+    if not _GEMINI_KEY or not broad:
+        return {"confirmed": 0, "field": "", "ok_titles": []}
+    broad = broad[:24]
+    key = f"{_PATENT_LLM_MODEL}|{name}|{dom}|" + "|".join((p.get("title") or "")[:50] for p in broad)
+    if key in _llm_patent_cache:
+        return _llm_patent_cache[key]
+    # Prompt « CPC-first » : les codes CPC sont le signal fort ; titre en appui, résumé
+    # court (le résumé pèse le plus en tokens, on le limite -> juste nécessaire).
+    lines = []
+    for i, p in enumerate(broad):
+        cpc = ", ".join((p.get("cpc") or [])[:6])
+        ab = (p.get("abstract") or "")[:140]
+        lines.append(f"[{i}] CPC : {cpc or '—'} | Titre : {p.get('title','')}" + (f" | Résumé : {ab}" if ab else ""))
+    user = (
+        f"Une startup nommée « {name} » travaille dans le domaine : « {dom} ».\n"
+        "Les brevets ci-dessous sont au nom d'une personne portant le même nom qu'un de ses dirigeants "
+        "et résidant dans le même pays, MAIS leur texte ne contient pas les mots-clés du domaine.\n"
+        "Pour CHAQUE brevet, estime la probabilité (confidence, 0 à 1) qu'il relève du MÊME champ "
+        "technique que la startup — proximité thématique entre la classe technique du brevet "
+        "(codes CPC surtout, puis titre) et l'activité de la startup. Forte proximité => probable "
+        "même personne (on brevète dans son domaine) ; faible proximité => probable homonyme. "
+        "Mets related=true si thématiquement proche. Déduis aussi le champ technique de la startup.\n\n"
+        "Brevets :\n" + "\n".join(lines)
+    )
+    try:
+        data = _gemini_json(user, _PATENT_JUDGE_SCHEMA)
+    except Exception:
+        data = None
+    if not data:
+        return {"confirmed": 0, "field": "", "ok_titles": []}
+    ok = []
+    for j in data.get("judgments", []):
+        try:
+            i = int(j.get("index")); c = float(j.get("confidence"))
+        except (TypeError, ValueError):
+            continue
+        if c >= _PATENT_LLM_THRESHOLD and 0 <= i < len(broad):
+            ok.append(broad[i].get("title") or "")
+    out = {"confirmed": len(ok), "field": str(data.get("startup_field", ""))[:120], "ok_titles": ok[:6]}
+    _llm_patent_cache[key] = out
+    return out
+
 def _patent_samples(data):
     out = []
     for p in data.get("data", []):
@@ -682,13 +788,18 @@ def _lens_officer_patents(officers, dom, jurisdiction=None):
         ab = p.get("abstract")
         if isinstance(ab, list) and ab:
             abs = (ab[0] or {}).get("text", "") or ""
+        cpc_raw = (b.get("classifications_cpc") or {}).get("classifications") or []
+        cpc = [c.get("symbol") for c in cpc_raw if isinstance(c, dict) and c.get("symbol")][:8]
         in_domain = bool(domset & set(_norm(title + " " + abs).split())) if domset else False
         for o in offs:
             if otoks[o] and any(otoks[o].issubset(ns) for ns in nsets):
-                slot = res.setdefault(o, {"count": 0, "in_domain": 0, "country": country, "samples": []})
+                slot = res.setdefault(o, {"count": 0, "in_domain": 0, "country": country, "samples": [], "broad": []})
                 slot["count"] += 1
                 if in_domain:
                     slot["in_domain"] += 1
+                elif len(slot["broad"]) < 8:
+                    # « à vérifier » (hors mots-clés) : on garde titre+résumé+CPC pour le juge IA.
+                    slot["broad"].append({"title": title, "abstract": abs, "cpc": cpc})
                 if len(slot["samples"]) < 3:
                     slot["samples"].append({"title": title, "year": (p.get("date_published") or "")[:4],
                                             "jurisdiction": p.get("jurisdiction"), "in_domain": in_domain})
@@ -697,11 +808,14 @@ def _lens_officer_patents(officers, dom, jurisdiction=None):
 
 @app.get("/company-patents")
 def company_patents(name: str = Query(...), officers: List[str] = Query(None),
-                    domain: List[str] = Query(None), jurisdiction: str = Query(None)):
+                    domain: List[str] = Query(None), jurisdiction: str = Query(None),
+                    deep: bool = Query(False)):
+    # deep=True (fiche détail) : lance la désambiguïsation IA des brevets « à vérifier ».
+    # deep=False (tri en masse) : lexical seul, pas d'appel LLM (coût maîtrisé).
     if not LENS_KEY:
         raise HTTPException(status_code=503, detail="Clé Lens absente (LENS_KEY / clé-Lens.txt).")
     dom = " ".join(k for k in (domain or []) if k).strip()
-    ck = f"{name}|{'|'.join(officers or [])}|{dom}|{jurisdiction}"
+    ck = f"{name}|{'|'.join(officers or [])}|{dom}|{jurisdiction}|{int(deep)}"
     if ck in _patent_cache:
         return _patent_cache[ck]
     try:
@@ -712,10 +826,20 @@ def company_patents(name: str = Query(...), officers: List[str] = Query(None),
     company_c = company["count"] if company["matched"] else 0
     officer_c = sum(v["count"] for v in offs_res.values())
     officer_dom = sum(v.get("in_domain", 0) for v in offs_res.values())
+    # Désambiguïsation IA (proximité thématique) des brevets « à vérifier », si activée.
+    llm_confirmed, llm_field = 0, ""
+    if deep and _GEMINI_KEY:
+        broad = [b for v in offs_res.values() for b in v.get("broad", [])]
+        if broad:
+            jr = _llm_confirm_patents(_clean_company(name) or name, dom, broad)
+            llm_confirmed, llm_field = jr.get("confirmed", 0), jr.get("field", "")
     result = {"company": company, "officers": offs_res,
               "total": company_c + officer_c,
               "officer_total": officer_c,          # dirigeants (nom + pays de résidence)
-              "officer_in_domain": officer_dom,    # sous-ensemble haute confiance (dans le domaine)
+              "officer_in_domain": officer_dom,    # sous-ensemble haute confiance (dans le domaine, lexical)
+              "officer_llm_confirmed": llm_confirmed,  # brevets « à vérifier » confirmés par proximité thématique (IA)
+              "llm_field": llm_field,              # typologie de la startup déduite par le LLM
+              "llm_available": bool(_GEMINI_KEY),
               "country": (jurisdiction or "").upper() or None,
               "matched": company["matched"] or officer_c > 0,
               "query": company.get("query")}
