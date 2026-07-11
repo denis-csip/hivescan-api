@@ -480,7 +480,7 @@ TOPIC_LABELS = {
 
 @app.get("/")
 def root():
-    return {"message": "Search API is running", "build": "topic-nan-2", "feature_max": FEATURE_MAX,
+    return {"message": "Search API is running", "build": "topic-rel-3", "feature_max": FEATURE_MAX,
             "pop_radar": POP_RADAR, "topic_labels": TOPIC_LABELS, "lens": bool(LENS_KEY)}
 
 @app.get("/domains")
@@ -1367,18 +1367,26 @@ def topic_search(topic_id: int = Query(..., description="Topic (0–29) à explo
     total = coll.count_documents(q)
     if not total:
         return {"items": [], "total": 0, "topic_id": topic_id, "topic_label": TOPIC_LABELS.get(topic_id)}
-    # Deux temps (Atlas M0) : classement léger projeté -> top `size`, puis docs complets.
+    # Deux temps (Atlas M0). Phase 1 : classement par PERTINENCE-TOPIC (pas par ICI, qui est
+    # global -> les mêmes méga-publiantes en tête de CHAQUE topic). topic_score = somme des
+    # probabilités de CE topic sur les articles de l'entreprise -> varie par topic, fait
+    # remonter les entreprises réellement centrées sur le topic. ~0,7 s sur M0 (testé).
     ranked = list(coll.aggregate([
         {"$match": q},
-        {"$project": {"_id": 0, "results_company_name": 1, "innovation_index": 1}},
-        {"$sort": {"innovation_index": -1}},
+        {"$project": {"_id": 0, "results_company_name": 1, "innovation_index": 1,
+            "topic_score": {"$sum": {"$map": {"input": {"$ifNull": ["$possible_triz_levels", []]}, "as": "p", "in":
+                {"$sum": {"$map": {"input": {"$ifNull": ["$$p.top_3_topic_probs", []]}, "as": "t", "in":
+                    {"$cond": [{"$eq": [{"$arrayElemAt": ["$$t", 0]}, topic_id]}, {"$arrayElemAt": ["$$t", 1]}, 0]}}}}}}}}},
+        {"$sort": {"topic_score": -1}},
         {"$limit": size},
     ]))
     names = [r.get("results_company_name") for r in ranked if r.get("results_company_name")]
+    score_by_name = {r["results_company_name"]: r.get("topic_score", 0) for r in ranked if r.get("results_company_name")}
     full_by_name = {d["results_company_name"]: d
                     for d in coll.find({"results_company_name": {"$in": names}}, {"_id": 0})}
     results = [full_by_name[n] for n in names if n in full_by_name]
     for doc in results:
+        doc["topic_score"] = round(score_by_name.get(doc["results_company_name"], 0), 3)
         doc["radar"] = company_radar(doc, ctx["fmax"])
         ec = doc.get("employee_count")
         if isinstance(ec, float) and ec != ec:
@@ -1393,7 +1401,7 @@ def topic_search(topic_id: int = Query(..., description="Topic (0–29) à explo
         arts.sort(key=lambda p: p.get("citationCount") or 0, reverse=True)
         doc["possible_triz_levels"] = arts[:20]
         doc["matched_article_count"] = len(arts)
-    results.sort(key=lambda d: d.get("innovation_index") or 0, reverse=True)
+    results.sort(key=lambda d: d.get("topic_score") or 0, reverse=True)   # pertinence-topic décroissante
     return _json_safe({"items": results, "total": total, "topic_id": topic_id, "topic_label": TOPIC_LABELS.get(topic_id)})
 
 
