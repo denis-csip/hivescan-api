@@ -480,7 +480,7 @@ TOPIC_LABELS = {
 
 @app.get("/")
 def root():
-    return {"message": "Search API is running", "build": "topic-trim-1", "feature_max": FEATURE_MAX,
+    return {"message": "Search API is running", "build": "topic-nan-2", "feature_max": FEATURE_MAX,
             "pop_radar": POP_RADAR, "topic_labels": TOPIC_LABELS, "lens": bool(LENS_KEY)}
 
 @app.get("/domains")
@@ -1323,6 +1323,18 @@ def search(
 
     return paginate(results)
 
+def _json_safe(o):
+    # Les docs contiennent des NaN (dissolution_date, branch, number_of_employees…). Starlette
+    # sérialise avec allow_nan=False -> ValueError -> 500 sans en-têtes CORS (NetworkError côté
+    # navigateur). On remplace NaN/Inf par None récursivement. (/search y échappe via paginate.)
+    if isinstance(o, float):
+        return None if (o != o or o == float("inf") or o == float("-inf")) else o
+    if isinstance(o, dict):
+        return {k: _json_safe(v) for k, v in o.items()}
+    if isinstance(o, list):
+        return [_json_safe(v) for v in o]
+    return o
+
 @app.get("/topic-search")
 def topic_search(topic_id: int = Query(..., description="Topic (0–29) à explorer — découverte topic-first, sans mot-clé"),
                  domain: Optional[str] = Query(None),
@@ -1382,7 +1394,7 @@ def topic_search(topic_id: int = Query(..., description="Topic (0–29) à explo
         doc["possible_triz_levels"] = arts[:20]
         doc["matched_article_count"] = len(arts)
     results.sort(key=lambda d: d.get("innovation_index") or 0, reverse=True)
-    return {"items": results, "total": total, "topic_id": topic_id, "topic_label": TOPIC_LABELS.get(topic_id)}
+    return _json_safe({"items": results, "total": total, "topic_id": topic_id, "topic_label": TOPIC_LABELS.get(topic_id)})
 
 
 
