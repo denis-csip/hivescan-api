@@ -34,7 +34,8 @@ SESSION_SECRET = os.getenv("SESSION_SECRET")
 IDEAS_APP = os.getenv("IDEAS_APP", "ARIZ-Copilot")               # x-application accepté par IDEAS
 IDEAS_ENDPOINT = os.getenv("IDEAS_ENDPOINT", "https://ideas.aiard.eu/api")
 _AUTH_REQUIRED = bool(ACCESS_KEY or SESSION_SECRET)
-_OPEN_PATHS = {"/", "/docs", "/openapi.json", "/redoc", "/ideas-login", "/auth-status", "/funding-coverage"}
+_OPEN_PATHS = {"/", "/docs", "/openapi.json", "/redoc", "/ideas-login", "/auth-status",
+               "/funding-coverage", "/domains", "/domain-meta"}
 
 def _b64u(b):
     return base64.urlsafe_b64encode(b).decode().rstrip("=")
@@ -126,7 +127,8 @@ def _study_public(d):
     return {"id": d.get("sid"), "name": d.get("name"), "query": d.get("query") or [],
             "jurisdiction": d.get("jurisdiction"), "innovation_min": d.get("innovation_min"),
             "result_count": d.get("result_count"), "category_id": d.get("category_id"),
-            "position": d.get("position", 0), "has_results": bool(d.get("results")),
+            "domain": d.get("domain"), "position": d.get("position", 0),
+            "has_results": bool(d.get("results")),
             "created": d.get("created"), "updated": d.get("updated")}
 
 @app.get("/studies")
@@ -156,6 +158,7 @@ async def save_study(request: Request):
            "innovation_min": body.get("innovation_min"),
            "result_count": body.get("result_count"),
            "category_id": body.get("category_id"),
+           "domain": body.get("domain"),
            "position": -time.time(),     # nouveau = en tête (tri par position ascendant)
            "created": now, "updated": now}
     # Snapshot des résultats (pour consultation instantanée sans re-run) — borné à
@@ -332,36 +335,32 @@ SCORE_FEATURES = {
 def _is_num(v):
     return isinstance(v, (int, float)) and v == v  # v==v écarte les NaN
 
-def _feature_maxes():
-    """Max de chaque feature sur toute la base (pour normaliser, comme dans la thèse)."""
+def _feature_maxes(coll):
+    """Max de chaque feature sur une collection (normalisation propre au domaine)."""
     maxes = {}
     for f in SCORE_FEATURES:
-        d = collection.find_one({f: {"$gt": 0}}, sort=[(f, -1)], projection={f: 1})
+        d = coll.find_one({f: {"$gt": 0}}, sort=[(f, -1)], projection={f: 1})
         m = (d or {}).get(f)
         maxes[f] = m if (_is_num(m) and m > 0) else 1.0
     return maxes
 
-FEATURE_MAX = _feature_maxes()
-
-def score_breakdown(doc):
-    """Contribution normalisée (0–1) de chaque feature disponible pour ce document."""
+def score_breakdown(doc, fmax):
+    """Contribution normalisée (0–1) de chaque feature, vs le max du DOMAINE."""
     out = {}
     for f, label in SCORE_FEATURES.items():
         v = doc.get(f)
         if _is_num(v) and v > 0:
-            out[label] = round(min(v / FEATURE_MAX[f], 1.0), 3)
+            out[label] = round(min(v / (fmax.get(f, 1) or 1), 1.0), 3)
     return out
 
 # --- Radar : 5 dimensions (catégories thèse Ch. 8) pour le profil d'innovation ---
-def _feature_avgs():
+def _feature_avgs(coll):
     avgs = {}
     for f in SCORE_FEATURES:
-        r = list(collection.aggregate(
+        r = list(coll.aggregate(
             [{"$match": {f: {"$gt": 0}}}, {"$group": {"_id": None, "a": {"$avg": f"${f}"}}}]))
         avgs[f] = (r[0]["a"] if r else 0) or 0
     return avgs
-
-FEATURE_AVG = _feature_avgs()
 
 # axe -> (libellé, feature source)
 RADAR_AXES = [
@@ -372,7 +371,7 @@ RADAR_AXES = [
     ("context", "Contexte", "employee_count"),
 ]
 
-def _axis_value(feat, raw, age_days=None):
+def _axis_value(feat, raw, fmax, age_days=None):
     # Contexte : effectif si dispo, sinon proxy « jeunesse startup » via l'âge.
     if feat == "employee_count" and not (_is_num(raw) and raw > 0):
         if _is_num(age_days) and age_days > 0:
@@ -380,24 +379,53 @@ def _axis_value(feat, raw, age_days=None):
         return 0.3
     if not (_is_num(raw) and raw > 0):
         return 0.0
-    return round(min(raw / (FEATURE_MAX.get(feat, 1) or 1), 1.0), 3)
+    return round(min(raw / (fmax.get(feat, 1) or 1), 1.0), 3)
 
-def company_radar(doc):
+def company_radar(doc, fmax):
     ak = next((k for k in doc if k.startswith("age_in_days")), None)
     age = doc.get(ak) if ak else None
-    return [{"key": k, "label": lbl, "value": _axis_value(feat, doc.get(feat), age)}
+    return [{"key": k, "label": lbl, "value": _axis_value(feat, doc.get(feat), fmax, age)}
             for k, lbl, feat in RADAR_AXES]
 
-def _population_radar():
+def _population_radar(favg, fmax):
     out = []
     for k, lbl, feat in RADAR_AXES:
-        v = round(min((FEATURE_AVG.get(feat, 0) or 0) / (FEATURE_MAX.get(feat, 1) or 1), 1.0), 3)
+        v = round(min((favg.get(feat, 0) or 0) / (fmax.get(feat, 1) or 1), 1.0), 3)
         if feat == "employee_count" and v == 0:
             v = 0.3
         out.append({"key": k, "label": lbl, "value": v})
     return out
 
-POP_RADAR = _population_radar()
+# === Domaines disciplinaires : un jeu de startups (= une collection) par domaine ===
+# Énergie = collection actuelle (thèse Connor, sponsor EDF). Les autres domaines se
+# peuplent en important un nouveau bundle OpenCorporates comme collection dédiée ;
+# ils apparaissent « à venir » tant qu'ils sont vides.
+DOMAINS = {
+    "energy":     {"label": "Énergie",     "collection": COLLECTION_NAME},
+    "cosmetics":  {"label": "Cosmétique",  "collection": "data_cosmetics"},
+    "metallurgy": {"label": "Métallurgie", "collection": "data_metallurgy"},
+    "biotech":    {"label": "Biotech",     "collection": "data_biotech"},
+    "plastics":   {"label": "Plasturgie",  "collection": "data_plastics"},
+    "railway":    {"label": "Ferroviaire", "collection": "data_railway"},
+    "packaging":  {"label": "Packaging",   "collection": "data_packaging"},
+}
+DEFAULT_DOMAIN = os.getenv("DEFAULT_DOMAIN", "energy")
+_domain_cache = {}
+
+def _domain_ctx(domain):
+    """Contexte d'un domaine (collection + normalisation propre), calculé une fois."""
+    dom = domain if domain in DOMAINS else DEFAULT_DOMAIN
+    if dom not in _domain_cache:
+        coll = db[DOMAINS[dom]["collection"]]
+        fmax = _feature_maxes(coll)
+        favg = _feature_avgs(coll)
+        _domain_cache[dom] = {"domain": dom, "coll": coll, "fmax": fmax, "favg": favg,
+                              "pop": _population_radar(favg, fmax)}
+    return _domain_cache[dom]
+
+_ENERGY = _domain_ctx(DEFAULT_DOMAIN)     # pré-chauffe le domaine par défaut au démarrage
+FEATURE_MAX = _ENERGY["fmax"]             # rétro-compat (endpoint racine)
+POP_RADAR = _ENERGY["pop"]
 
 # --- Libellés de topics = Table 9.9 « Chosen Topics » de la thèse (Human-in-the-Loop
 #     LLM Labeling, §9.2.6). Thèse indexée 1..30 ; notre base 0..29 → label[id]=Table9.9[id+1].
@@ -439,6 +467,25 @@ TOPIC_LABELS = {
 def root():
     return {"message": "Search API is running", "feature_max": FEATURE_MAX,
             "pop_radar": POP_RADAR, "topic_labels": TOPIC_LABELS, "lens": bool(LENS_KEY)}
+
+@app.get("/domains")
+def list_domains():
+    """Domaines disciplinaires disponibles (ouvert) — le POC peuple son sélecteur."""
+    out = []
+    for did, meta in DOMAINS.items():
+        try:
+            n = db[meta["collection"]].estimated_document_count()
+        except Exception:
+            n = 0
+        out.append({"id": did, "label": meta["label"], "count": n, "populated": n > 0})
+    return {"domains": out, "default": DEFAULT_DOMAIN}
+
+@app.get("/domain-meta")
+def domain_meta(domain: str = Query(None)):
+    """Normalisation + libellés de topics propres au domaine choisi (radar population)."""
+    ctx = _domain_ctx(domain)
+    return {"domain": ctx["domain"], "pop_radar": ctx["pop"],
+            "feature_max": ctx["fmax"], "topic_labels": TOPIC_LABELS}
 
 # --- Lens (brevets) : signal de crédibilité par entreprise ------------------
 # Une entreprise de la base qui détient des brevets = crédibilité renforcée pour
@@ -671,8 +718,8 @@ def funding_coverage():
     return out
 
 @app.get("/company-funding")
-def company_funding(name: str = Query(...)):
-    doc = collection.find_one(
+def company_funding(name: str = Query(...), domain: str = Query(None)):
+    doc = _domain_ctx(domain)["coll"].find_one(
         {"results_company_name": name},
         {"results_company_registry_url": 1, "results_company_company_number": 1,
          "results_company_jurisdiction_code": 1, "_id": 0})
@@ -901,7 +948,7 @@ def search(
     sort: Optional[str] = Query(None, description="Sort by field and order, e.g. citations:asc or year:desc"),
     innovation_min: Optional[float] = Query(None, ge=0.0, le=1.0, description="Minimum innovation index (0–1)"),
     innovation_max: Optional[float] = Query(None, ge=0.0, le=1.0, description="Maximum innovation index (0–1)"),
-    
+    domain: Optional[str] = Query(None, description="Domaine disciplinaire (energy, cosmetics, …)"),
 ):
     """
     Search documents. Title/abstract are inside possible_triz_levels (an array of subdocs).
@@ -991,7 +1038,9 @@ def search(
     else:
         rank_field, order = "innovation_index", -1
 
-    ranked = list(collection.aggregate([
+    ctx = _domain_ctx(domain)            # collection + normalisation propres au domaine
+    coll = ctx["coll"]
+    ranked = list(coll.aggregate([
         {"$match": mongo_query},
         {"$project": {"_id": 0, "results_company_name": 1, rank_field: 1}},
         {"$sort": {rank_field: order}},
@@ -1002,7 +1051,7 @@ def search(
         raise HTTPException(status_code=404, detail="No documents matched your query")
 
     full_by_name = {d["results_company_name"]: d
-                    for d in collection.find({"results_company_name": {"$in": names}}, {"_id": 0})}
+                    for d in coll.find({"results_company_name": {"$in": names}}, {"_id": 0})}
     # On respecte l'ordre du classement (phase 1).
     results = [full_by_name[n] for n in names if n in full_by_name]
     
@@ -1046,13 +1095,13 @@ def search(
     if topic_id is None:
         for doc in results:
             # Radar 5 dimensions (avant nettoyage NaN : utilise l'effectif/âge bruts).
-            doc["radar"] = company_radar(doc)
+            doc["radar"] = company_radar(doc, ctx["fmax"])
             # NaN -> None pour un JSON propre (ex. employee_count manquant).
             ec = doc.get("employee_count")
             if isinstance(ec, float) and ec != ec:
                 doc["employee_count"] = None
-            # Décomposition du score (traçabilité).
-            doc["score_breakdown"] = score_breakdown(doc)
+            # Décomposition du score (traçabilité, normalisé au domaine).
+            doc["score_breakdown"] = score_breakdown(doc, ctx["fmax"])
         # Classement par défaut = innovation_index décroissant (cœur de HiveScan).
         # Si l'utilisateur a demandé un `sort` explicite, on respecte l'ordre Mongo.
         if not sort:
