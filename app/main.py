@@ -99,10 +99,15 @@ def _ideas_signin(email, password):
     return (u, None) if u else (None, "invalid")
 
 @app.get("/auth-status")
-def auth_status():
-    """Le POC interroge cet endpoint (ouvert) pour savoir s'il doit afficher le login."""
+def auth_status(request: Request):
+    """Le POC interroge cet endpoint (ouvert) pour savoir s'il doit afficher le login.
+    Lit le jeton (optionnel) pour indiquer si l'utilisateur est admin."""
+    auth = request.headers.get("authorization") or ""
+    tok = auth[7:] if auth[:7].lower() == "bearer " else None
+    data = _verify_token(tok) if tok else None
+    is_admin = bool(data and (data.get("admin") or _is_admin(data.get("email"))))
     return {"login_required": _AUTH_REQUIRED, "ideas": bool(SESSION_SECRET),
-            "storage_ready": studies_col is not None}
+            "storage_ready": studies_col is not None, "is_admin": is_admin}
 
 @app.post("/ideas-login")
 async def ideas_login(request: Request):
@@ -513,7 +518,11 @@ def _current_admin(request: Request):
     auth = request.headers.get("authorization") or ""
     tok = auth[7:] if auth[:7].lower() == "bearer " else None
     data = _verify_token(tok) if tok else None
-    return bool(data and data.get("admin"))
+    if not data:
+        return False
+    # admin si le claim est présent OU si l'email est dans l'allowlist (sessions
+    # ouvertes avant l'ajout du claim -> pas besoin de se reconnecter).
+    return bool(data.get("admin")) or _is_admin(data.get("email"))
 
 @app.get("/ideality")
 def get_ideality(domain: str = Query(None)):
