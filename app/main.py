@@ -4,7 +4,6 @@ from fastapi.responses import JSONResponse
 from fastapi_pagination import Page, add_pagination, paginate
 from pymongo import MongoClient
 from typing import Optional, List
-from collections import Counter
 import re
 import os
 import json
@@ -17,10 +16,17 @@ import datetime
 import unicodedata
 import urllib.request
 import urllib.parse
-import urllib.error
 
 app = FastAPI()
 add_pagination(app)
+
+def _cache_put(cache, key, val, cap=2000):
+    """Caches mémoire bornés : au-delà de `cap` entrées on repart à vide (simple et
+    suffisant pour un POC — évite la fuite mémoire sur un dyno longue durée)."""
+    if len(cache) >= cap:
+        cache.clear()
+    cache[key] = val
+    return val
 
 # --- Authentification (défini AVANT le CORS pour que les 401 aient les en-têtes CORS) ---
 # Deux mécanismes, activables par variables d'env :
@@ -350,6 +356,20 @@ SCORE_FEATURES = {
 def _is_num(v):
     return isinstance(v, (int, float)) and v == v  # v==v écarte les NaN
 
+def _json_safe(o):
+    # Les docs Mongo (et les fichiers d'enrichissement) peuvent contenir des NaN
+    # (dissolution_date, branch, number_of_employees…). Starlette sérialise avec
+    # allow_nan=False -> ValueError -> 500 SANS en-têtes CORS (« NetworkError » côté
+    # navigateur). Tout endpoint qui renvoie un dict brut de docs doit passer par ici.
+    # (/search y échappe via paginate/pydantic.)
+    if isinstance(o, float):
+        return None if (o != o or o == float("inf") or o == float("-inf")) else o
+    if isinstance(o, dict):
+        return {k: _json_safe(v) for k, v in o.items()}
+    if isinstance(o, list):
+        return [_json_safe(v) for v in o]
+    return o
+
 def _feature_maxes(coll):
     """Max de chaque feature sur une collection (normalisation propre au domaine)."""
     maxes = {}
@@ -438,9 +458,7 @@ def _domain_ctx(domain):
                               "pop": _population_radar(favg, fmax)}
     return _domain_cache[dom]
 
-_ENERGY = _domain_ctx(DEFAULT_DOMAIN)     # pré-chauffe le domaine par défaut au démarrage
-FEATURE_MAX = _ENERGY["fmax"]             # rétro-compat (endpoint racine)
-POP_RADAR = _ENERGY["pop"]
+_domain_ctx(DEFAULT_DOMAIN)               # pré-chauffe le domaine par défaut au démarrage
 
 # --- Libellés de topics = Table 9.9 « Chosen Topics » de la thèse (Human-in-the-Loop
 #     LLM Labeling, §9.2.6). Thèse indexée 1..30 ; notre base 0..29 → label[id]=Table9.9[id+1].
@@ -480,8 +498,8 @@ TOPIC_LABELS = {
 
 @app.get("/")
 def root():
-    return {"message": "Search API is running", "build": "topic-rel-3", "feature_max": FEATURE_MAX,
-            "pop_radar": POP_RADAR, "topic_labels": TOPIC_LABELS, "lens": bool(LENS_KEY)}
+    # Healthcheck + marqueur de build (le POC consomme /domain-meta, plus cette racine).
+    return {"message": "Search API is running", "build": "audit-1", "lens": bool(LENS_KEY)}
 
 @app.get("/domains")
 def list_domains():
@@ -710,8 +728,7 @@ def _llm_confirm_patents(name, dom, broad):
         if c >= _PATENT_LLM_THRESHOLD and 0 <= i < len(broad):
             ok.append(broad[i].get("title") or "")
     out = {"confirmed": len(ok), "field": str(data.get("startup_field", ""))[:120], "ok_titles": ok[:6]}
-    _llm_patent_cache[key] = out
-    return out
+    return _cache_put(_llm_patent_cache, key, out, cap=1000)
 
 def _patent_samples(data):
     out = []
@@ -843,8 +860,7 @@ def company_patents(name: str = Query(...), officers: List[str] = Query(None),
               "country": (jurisdiction or "").upper() or None,
               "matched": company["matched"] or officer_c > 0,
               "query": company.get("query")}
-    _patent_cache[ck] = result
-    return result
+    return _cache_put(_patent_cache, ck, result)
 
 # --- Financement / levées de fonds (GRATUIT, multi-registres) ---------------------
 # Signal unifié construit à partir des registres publics, MÊME schéma quel que soit
@@ -944,7 +960,7 @@ def company_funding(name: str = Query(...), domain: str = Query(None)):
         return {"available": False, "number": key, "jurisdiction": jur,
                 "source": source, "reason": "pas encore enrichi"}
     sig = funding_signal(f)
-    return {"available": True, "number": key, "jurisdiction": jur, "source": source,
+    return _json_safe({"available": True, "number": key, "jurisdiction": jur, "source": source,
             "funding": f, "signal": sig,
             "equity_raises": f.get("share_allotments") or 0,
             "has_debt": bool(f.get("has_charges")),
@@ -952,11 +968,13 @@ def company_funding(name: str = Query(...), domain: str = Query(None)):
             # Santé (utile pour NO/DK où la levée n'est pas publiée) :
             "raises_tracked": f.get("raises_tracked", True),
             "status": f.get("status"),
-            "has_insolvency": bool(f.get("has_insolvency"))}
+            "has_insolvency": bool(f.get("has_insolvency"))})
 
 # --- OpenAlex : publications propres pour un sujet (remplace les articles bruts) --
 # Repris du pattern ARIZ-Copilot (openalex-papers). Gratuit ; clé optionnelle
 # (Openalex_key.txt) pour éviter le délestage. Clé côté serveur uniquement.
+# NB (audit 2026-07) : l'endpoint /openalex n'est PLUS appelé par le POC (qui utilise
+# /officer-pubs) ; conservé comme brique de démo. _reconstruct_abstract, lui, sert aux deux.
 def _load_openalex_key():
     k = os.getenv("OPENALEX_API_KEY")
     if k:
@@ -1020,8 +1038,7 @@ def openalex(keywords: List[str] = Query(None), n: int = Query(8, ge=1, le=25)):
             "abstract": _reconstruct_abstract(w.get("abstract_inverted_index")),
         })
     result = {"papers": [p for p in papers if p["title"]]}
-    _openalex_cache[ck] = result
-    return result
+    return _cache_put(_openalex_cache, ck, result)
 
 # --- Publications des DIRIGEANTS via OpenAlex, avec désambiguïsation homonymes ---
 # Méthode thèse §7.4.2 : requête par nom de dirigeant + FILTRE DE PERTINENCE AU
@@ -1140,8 +1157,7 @@ def officer_pubs(officers: List[str] = Query(None), domain: List[str] = Query(No
 
     out.sort(key=lambda p: (p.get("in_domain", False), p.get("citations") or 0), reverse=True)
     result = {"papers": out[:12], "officers": names, "domain": dom, "resolved": resolved}
-    _officer_cache[ck] = result
-    return result
+    return _cache_put(_officer_cache, ck, result)
 
 @app.get("/search", response_model=Page[dict])
 def search(
@@ -1323,17 +1339,7 @@ def search(
 
     return paginate(results)
 
-def _json_safe(o):
-    # Les docs contiennent des NaN (dissolution_date, branch, number_of_employees…). Starlette
-    # sérialise avec allow_nan=False -> ValueError -> 500 sans en-têtes CORS (NetworkError côté
-    # navigateur). On remplace NaN/Inf par None récursivement. (/search y échappe via paginate.)
-    if isinstance(o, float):
-        return None if (o != o or o == float("inf") or o == float("-inf")) else o
-    if isinstance(o, dict):
-        return {k: _json_safe(v) for k, v in o.items()}
-    if isinstance(o, list):
-        return [_json_safe(v) for v in o]
-    return o
+_topic_cache = {}          # (domaine, topic, size) -> réponse complète (requêtes sans filtre)
 
 @app.get("/topic-search")
 def topic_search(topic_id: int = Query(..., description="Topic (0–29) à explorer — découverte topic-first, sans mot-clé"),
@@ -1343,11 +1349,17 @@ def topic_search(topic_id: int = Query(..., description="Topic (0–29) à explo
                  innovation_min: Optional[float] = Query(None, ge=0.0, le=1.0),
                  size: int = Query(60, ge=1, le=200)):
     """Découverte TOPIC-FIRST (thèse) : renvoie les ENTREPRISES dont ≥1 article relève du
-    topic choisi (sortie du topic-modeling LDA/ETM), classées par innovation_index, enrichies
+    topic choisi (sortie du topic-modeling LDA/ETM), classées par PERTINENCE-TOPIC, enrichies
     (radar + décomposition) comme /search — donc affichables tel quel dans la table du POC.
     Combinable avec mot-clé/juridiction/innovation_min. `total` = compte réel du topic."""
     ctx = _domain_ctx(domain)
     coll = ctx["coll"]
+    # Les affectations de topics sont STATIQUES : la réponse « topic seul » est déterministe
+    # -> cache mémoire (évite count+aggregate ~1s à chaque clic ; cap petit, payloads ~1,3 Mo).
+    unfiltered = not (jurisdiction or keywords or innovation_min is not None)
+    tck = (ctx["domain"], topic_id, size)
+    if unfiltered and tck in _topic_cache:
+        return _topic_cache[tck]
     # Un article a top_3_topic_probs = [[id, prob], …] ; on matche une paire dont l'index 0 == topic_id.
     filters = [{"possible_triz_levels": {"$elemMatch": {"top_3_topic_probs": {"$elemMatch": {"0": topic_id}}}}}]
     if jurisdiction:
@@ -1402,13 +1414,7 @@ def topic_search(topic_id: int = Query(..., description="Topic (0–29) à explo
         doc["possible_triz_levels"] = arts[:20]
         doc["matched_article_count"] = len(arts)
     results.sort(key=lambda d: d.get("topic_score") or 0, reverse=True)   # pertinence-topic décroissante
-    return _json_safe({"items": results, "total": total, "topic_id": topic_id, "topic_label": TOPIC_LABELS.get(topic_id)})
-
-
-
-#jurisdiction seems to work, but need to use only as a filter
-#also add a .lower
-
-#need to add real DB online - but currently offline
-
-#need to sort AFTER getting filtered_results
+    out = _json_safe({"items": results, "total": total, "topic_id": topic_id, "topic_label": TOPIC_LABELS.get(topic_id)})
+    if unfiltered:
+        _cache_put(_topic_cache, tck, out, cap=6)
+    return out
