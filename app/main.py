@@ -321,6 +321,10 @@ COLLECTION_NAME = os.getenv("MONGO_COLLECTION", "data")
 # Borne mémoire de /search : nb max de documents complets chargés (évite l'OOM en
 # prod quand un mot-clé large matche des milliers d'entreprises). Configurable.
 MAX_SEARCH_DOCS = int(os.getenv("MAX_SEARCH_DOCS", "500"))
+# Articles gardés PAR ENTREPRISE dans /search (les plus cités). Charger tous les articles
+# de 500 entreprises = ~110 Mo BSON (52k articles) -> OOM sur le dyno 512 Mo. Plafonner +
+# projeter (sans abstract) ramène à ~3 Mo. Le POC ne lit que title/year/citationCount/ner/topics.
+ARTICLES_PER_COMPANY = int(os.getenv("ARTICLES_PER_COMPANY", "25"))
 
 client = MongoClient(MONGO_URI)
 db = client[DB_NAME]
@@ -499,7 +503,7 @@ TOPIC_LABELS = {
 @app.get("/")
 def root():
     # Healthcheck + marqueur de build (le POC consomme /domain-meta, plus cette racine).
-    return {"message": "Search API is running", "build": "audit-1", "lens": bool(LENS_KEY)}
+    return {"message": "Search API is running", "build": "oom-fix-1", "lens": bool(LENS_KEY)}
 
 @app.get("/domains")
 def list_domains():
@@ -1197,10 +1201,10 @@ def search(
                     if topic == topic_id:
                         matches.append({
                             "company": company["results_company_name"],
-                            "paperId": paper["paperId"],
-                            "title": paper["title"],
-                            "abstract":paper["abstract"],
-                            "ner":paper["ner"],
+                            "paperId": paper.get("paperId"),
+                            "title": paper.get("title"),
+                            "abstract": paper.get("abstract"),   # absent depuis le plafonnement d'articles
+                            "ner": paper.get("ner"),
                             "topic_id": topic,
                             "score": prob,
                             "year": paper.get("year"),
@@ -1271,46 +1275,41 @@ def search(
     if not names:
         raise HTTPException(status_code=404, detail="No documents matched your query")
 
-    full_by_name = {d["results_company_name"]: d
-                    for d in coll.find({"results_company_name": {"$in": names}}, {"_id": 0})}
+    # Phase 2 : NE PAS charger les documents complets (110 Mo pour un mot-clé large ->
+    # OOM sur le dyno 512 Mo -> worker tué -> connexion coupée -> « NetworkError »). On
+    # projette côté Mongo : articles filtrés au mot-clé, plafonnés aux N plus cités, SANS
+    # abstract (jamais lu par le POC). ~3 Mo au lieu de 110. Filtre/tri déportés en agrégation.
+    art_fields = {f: f"$$a.{f}" for f in
+                  ("title", "year", "citationCount", "ner", "top_3_topic_probs", "paperId")}
+    if keywords:
+        rgx = "(" + "|".join(re.escape(k) for k in keywords if k) + ")"
+        arts_src = {"$filter": {"input": {"$ifNull": ["$possible_triz_levels", []]}, "as": "a",
+                    "cond": {"$regexMatch": {
+                        "input": {"$concat": [{"$ifNull": ["$$a.title", ""]}, " ",
+                                              {"$ifNull": ["$$a.abstract", ""]}]},
+                        "regex": rgx, "options": "i"}}}}
+    else:
+        arts_src = {"$ifNull": ["$possible_triz_levels", []]}
+    pipe = [{"$match": {"results_company_name": {"$in": names}}},
+            {"$addFields": {"_arts": arts_src}}]
+    if keywords:
+        # On ne garde que les entreprises ayant ≥1 article pertinent (comportement d'avant).
+        pipe.append({"$match": {"_arts.0": {"$exists": True}}})
+    pipe += [
+        {"$addFields": {
+            "matched_article_count": {"$size": "$_arts"},
+            "possible_triz_levels": {"$map": {
+                "input": {"$slice": [{"$sortArray": {"input": "$_arts",
+                          "sortBy": {"citationCount": -1}}}, ARTICLES_PER_COMPANY]},
+                "as": "a", "in": art_fields}}}},
+        {"$project": {"_id": 0, "_arts": 0}},
+    ]
+    try:
+        full_by_name = {d["results_company_name"]: d for d in coll.aggregate(pipe)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"search phase-2: {e}")
     # On respecte l'ordre du classement (phase 1).
     results = [full_by_name[n] for n in names if n in full_by_name]
-    
-    #!!!!!!!!!!!!!!!!!!!!!!!
-    #rebuild and test if this only gets the corresponding articles
-    
-    #need to add a way to add asc et desc to filter for articles
-    if keywords:
-        try:
-            # Compile les regex une fois (mêmes règles que le $match Mongo).
-            regex_list = [re.compile(re.escape(kw), re.IGNORECASE) for kw in keywords]
-
-            filtered_results = []
-            for doc in results:
-                # On ne garde QUE les articles qui matchent réellement le(s) mot(s)-clé(s).
-                matching = []
-                for lvl in doc.get("possible_triz_levels", []):
-                    title = lvl.get("title") or ""
-                    abstract = lvl.get("abstract") or ""
-                    if any(r.search(title) or r.search(abstract) for r in regex_list):
-                        matching.append(lvl)
-
-                if matching:
-                    # Tri des articles pertinents par citations décroissantes.
-                    matching.sort(key=lambda l: l.get("citationCount") or 0, reverse=True)
-                    # On conserve tout le document entreprise (juridiction, innovation_index, …)
-                    # mais on remplace ses articles par les seuls articles pertinents.
-                    doc["possible_triz_levels"] = matching
-                    doc["matched_article_count"] = len(matching)
-                    filtered_results.append(doc)
-
-            # >>> LE FIX : on renvoie bien les résultats filtrés (avant, cette ligne
-            #     était commentée, donc l'API renvoyait tous les articles).
-            #     Le classement des entreprises est fait plus bas (par innovation_index).
-            results = filtered_results
-
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
 
     # --- Enrichissement + classement par potentiel d'innovation ------------------
     if topic_id is None:
