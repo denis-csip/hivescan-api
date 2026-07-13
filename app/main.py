@@ -468,7 +468,7 @@ _domain_ctx(DEFAULT_DOMAIN)               # pré-chauffe le domaine par défaut 
 #     LLM Labeling, §9.2.6). Thèse indexée 1..30 ; notre base 0..29 → label[id]=Table9.9[id+1].
 #     Alignement vérifié sur les titres représentatifs (topics 1/5/27).
 TOPIC_LABELS = {
-    0: "General research approaches, modeling & structural efficiency analysis",
+    0: "General research approaches, modeling, and structural efficiency analysis",
     1: "Effects and properties in physical and chemical reaction systems",
     2: "Performance improvement, influencing factors, and uncertainty analysis",
     3: "Techniques, algorithms, case studies, and associated risk analysis",
@@ -494,7 +494,7 @@ TOPIC_LABELS = {
     23: "Modeling of formation, transfer coefficients, and basin analysis",
     24: "Parameter testing, stability, and growth-loss dynamics analysis",
     25: "Experimental studies of space systems, stars, and environmental zones",
-    26: "Signal detection and satellite-based observational instrumentation",
+    26: "Signal detection and satellite-based observational instrumentation investigations",
     27: "Diverse topics: workshops, colliders, and multilingual case studies",
     28: "General scientific synthesis and comparison",
     29: "Plant chemistry and environmental monitoring",
@@ -503,7 +503,7 @@ TOPIC_LABELS = {
 @app.get("/")
 def root():
     # Healthcheck + marqueur de build (le POC consomme /domain-meta, plus cette racine).
-    return {"message": "Search API is running", "build": "oom-fix-1", "lens": bool(LENS_KEY)}
+    return {"message": "Search API is running", "build": "topic-num-1", "lens": bool(LENS_KEY)}
 
 @app.get("/domains")
 def list_domains():
