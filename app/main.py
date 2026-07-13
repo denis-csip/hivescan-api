@@ -323,7 +323,8 @@ COLLECTION_NAME = os.getenv("MONGO_COLLECTION", "data")
 MAX_SEARCH_DOCS = int(os.getenv("MAX_SEARCH_DOCS", "500"))
 # Articles gardés PAR ENTREPRISE dans /search (les plus cités). Charger tous les articles
 # de 500 entreprises = ~110 Mo BSON (52k articles) -> OOM sur le dyno 512 Mo. Plafonner +
-# projeter (sans abstract) ramène à ~3 Mo. Le POC ne lit que title/year/citationCount/ner/topics.
+# projeter (sans abstract/authors, les gros champs) ramène à ~3,5 Mo. On garde tous les
+# petits champs affichés par le POC : ner, fieldsOfStudy, score TRIZ, revue, lien PDF.
 ARTICLES_PER_COMPANY = int(os.getenv("ARTICLES_PER_COMPANY", "25"))
 
 client = MongoClient(MONGO_URI)
@@ -503,7 +504,7 @@ TOPIC_LABELS = {
 @app.get("/")
 def root():
     # Healthcheck + marqueur de build (le POC consomme /domain-meta, plus cette racine).
-    return {"message": "Search API is running", "build": "topic-num-1", "lens": bool(LENS_KEY)}
+    return {"message": "Search API is running", "build": "articles-ner-1", "lens": bool(LENS_KEY)}
 
 @app.get("/domains")
 def list_domains():
@@ -1279,8 +1280,14 @@ def search(
     # OOM sur le dyno 512 Mo -> worker tué -> connexion coupée -> « NetworkError »). On
     # projette côté Mongo : articles filtrés au mot-clé, plafonnés aux N plus cités, SANS
     # abstract (jamais lu par le POC). ~3 Mo au lieu de 110. Filtre/tri déportés en agrégation.
+    # Champs d'article servis : ceux réellement affichés par le POC (fiche détail + rapport) —
+    # NER (entités déjà extraites), champs disciplinaires, score TRIZ/article, revue, lien PDF.
+    # On EXCLUT seulement les gros champs (abstract, authors) responsables de l'OOM.
     art_fields = {f: f"$$a.{f}" for f in
-                  ("title", "year", "citationCount", "ner", "top_3_topic_probs", "paperId")}
+                  ("title", "year", "citationCount", "ner", "top_3_topic_probs", "paperId",
+                   "fieldsOfStudy", "name", "score", "referenceCount")}
+    # openAccessPdf : garder UNIQUEMENT l'URL (l'objet complet embarque un long disclaimer).
+    art_fields["openAccessPdf"] = {"url": "$$a.openAccessPdf.url"}
     if keywords:
         rgx = "(" + "|".join(re.escape(k) for k in keywords if k) + ")"
         arts_src = {"$filter": {"input": {"$ifNull": ["$possible_triz_levels", []]}, "as": "a",
