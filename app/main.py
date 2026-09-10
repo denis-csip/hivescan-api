@@ -93,7 +93,10 @@ def _ideas_signin(email, password):
     body = json.dumps({"query": mutation}).encode()
     req = urllib.request.Request(
         IDEAS_ENDPOINT, data=body, method="POST",
-        headers={"Content-Type": "application/json", "x-application": IDEAS_APP})
+        # Le User-Agent par défaut « Python-urllib » est BLOQUÉ (403) par la protection
+        # anti-robots Cloudflare d'IDEAS (depuis sept. 2026). Tout autre UA passe.
+        headers={"Content-Type": "application/json", "x-application": IDEAS_APP,
+                 "User-Agent": "hivescan/1.0 (+https://hivescan.net)", "Accept": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=20) as r:
             j = json.load(r)
@@ -303,17 +306,35 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# MongoDB : URI depuis l'env (prod) ; sinon fichier local NON commité (dev).
-# Aucun secret en dur dans le code.
+# Secrets : variable d'environnement (prod) ; sinon coffre local HORS OneDrive (dev).
+# Aucun secret en dur dans le code, aucun fichier de clé dans un dossier synchronisé.
+VAULT_FILE = os.environ.get("CLAUDE_SECRETS_FILE") or os.path.join(
+    os.path.expanduser("~"), ".secrets", "claude.env")
+_vault_cache = None
+
+
+def _vault_get(name):
+    """Valeur lue dans le coffre local (fichier de lignes « NAME=valeur »), ou None."""
+    global _vault_cache
+    if _vault_cache is None:
+        _vault_cache = {}
+        if os.path.exists(VAULT_FILE):
+            with open(VAULT_FILE, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, _, v = line.partition("=")
+                    _vault_cache[k.strip()] = v.strip()
+    return _vault_cache.get(name) or None
+
+
 def _load_mongo_uri():
-    u = os.getenv("MONGO_URI")
+    u = (os.getenv("MONGO_URI") or "").strip() or _vault_get("MONGO_URI")
     if u:
-        return u.strip()
-    p = os.path.join(os.path.dirname(__file__), "..", "mongo_uri.txt")
-    if os.path.exists(p):
-        return open(p, encoding="utf-8").read().strip()
-    raise RuntimeError("MONGO_URI absent : définir la variable d'env MONGO_URI "
-                       "(ou créer v0_api_hivescan-main/mongo_uri.txt en local).")
+        return u
+    raise RuntimeError("MONGO_URI absent : définir la variable d'env MONGO_URI, "
+                       f"ou ajouter « MONGO_URI=... » dans {VAULT_FILE}.")
 
 MONGO_URI = _load_mongo_uri()
 DB_NAME = os.getenv("MONGO_DB", "hivescan_data")
@@ -504,7 +525,7 @@ TOPIC_LABELS = {
 @app.get("/")
 def root():
     # Healthcheck + marqueur de build (le POC consomme /domain-meta, plus cette racine).
-    return {"message": "Search API is running", "build": "articles-ner-1", "lens": bool(LENS_KEY)}
+    return {"message": "Search API is running", "build": "ideas-ua-fix", "lens": bool(LENS_KEY)}
 
 @app.get("/domains")
 def list_domains():
@@ -595,15 +616,10 @@ def reset_ideality(request: Request, domain: str = Query(None)):
 # Une entreprise de la base qui détient des brevets = crédibilité renforcée pour
 # un investisseur (maturité commerciale). Clé Lens lue côté serveur uniquement.
 def _load_lens_key():
-    k = os.getenv("LENS_KEY")
+    k = os.getenv("LENS_KEY") or os.getenv("LENS_API_KEY")
     if k:
         return k.strip()
-    p = os.getenv("LENS_KEY_FILE") or os.path.join(
-        os.path.dirname(__file__), "..", "..", "ARIZ-Copilot", "clé-Lens.txt")
-    try:
-        return open(p, encoding="utf-8").read().strip()
-    except Exception:
-        return None
+    return _vault_get("LENS_API_KEY")
 
 LENS_KEY = _load_lens_key()
 _LEGAL_SUFFIX = re.compile(
@@ -835,7 +851,8 @@ def company_patents(name: str = Query(...), officers: List[str] = Query(None),
     # deep=True (fiche détail) : lance la désambiguïsation IA des brevets « à vérifier ».
     # deep=False (tri en masse) : lexical seul, pas d'appel LLM (coût maîtrisé).
     if not LENS_KEY:
-        raise HTTPException(status_code=503, detail="Clé Lens absente (LENS_KEY / clé-Lens.txt).")
+        raise HTTPException(status_code=503,
+                            detail="Clé Lens absente (env LENS_KEY, ou LENS_API_KEY dans le coffre local).")
     dom = " ".join(k for k in (domain or []) if k).strip()
     ck = f"{name}|{'|'.join(officers or [])}|{dom}|{jurisdiction}|{int(deep)}"
     if ck in _patent_cache:
@@ -977,18 +994,14 @@ def company_funding(name: str = Query(...), domain: str = Query(None)):
 
 # --- OpenAlex : publications propres pour un sujet (remplace les articles bruts) --
 # Repris du pattern ARIZ-Copilot (openalex-papers). Gratuit ; clé optionnelle
-# (Openalex_key.txt) pour éviter le délestage. Clé côté serveur uniquement.
+# (env OPENALEX_API_KEY, sinon coffre local) pour éviter le délestage. Côté serveur uniquement.
 # NB (audit 2026-07) : l'endpoint /openalex n'est PLUS appelé par le POC (qui utilise
 # /officer-pubs) ; conservé comme brique de démo. _reconstruct_abstract, lui, sert aux deux.
 def _load_openalex_key():
     k = os.getenv("OPENALEX_API_KEY")
     if k:
         return k.strip()
-    p = os.path.join(os.path.dirname(__file__), "..", "..", "ARIZ-Copilot", "Openalex_key.txt")
-    try:
-        return open(p, encoding="utf-8").read().strip()
-    except Exception:
-        return None
+    return _vault_get("OPENALEX_API_KEY")
 
 OPENALEX_KEY = _load_openalex_key()
 _openalex_cache = {}
