@@ -525,7 +525,8 @@ TOPIC_LABELS = {
 @app.get("/")
 def root():
     # Healthcheck + marqueur de build (le POC consomme /domain-meta, plus cette racine).
-    return {"message": "Search API is running", "build": "lens-cache-1", "lens": bool(LENS_KEY)}
+    return {"message": "Search API is running", "build": "openalex-header-1", "lens": bool(LENS_KEY),
+            "openalex": bool(OPENALEX_KEY)}
 
 @app.get("/domains")
 def list_domains():
