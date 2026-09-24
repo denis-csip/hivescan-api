@@ -525,7 +525,7 @@ TOPIC_LABELS = {
 @app.get("/")
 def root():
     # Healthcheck + marqueur de build (le POC consomme /domain-meta, plus cette racine).
-    return {"message": "Search API is running", "build": "dedup-soeurs-1", "lens": bool(LENS_KEY),
+    return {"message": "Search API is running", "build": "concepts-or-1", "lens": bool(LENS_KEY),
             "openalex": bool(OPENALEX_KEY)}
 
 @app.get("/domains")
@@ -1513,7 +1513,8 @@ def topic_search(topic_id: int = Query(..., description="Topic (0–29) à explo
                  domain: Optional[str] = Query(None),
                  jurisdiction: Optional[str] = Query(None),
                  keywords: Optional[List[str]] = Query(None, description="Optionnel : combine topic ∩ mot-clé"),
-                 concepts: Optional[List[str]] = Query(None, description="Optionnel : concepts du topic (ET logique)"),
+                 concepts: Optional[List[str]] = Query(None, description="Optionnel : concepts du topic"),
+                 cmode: str = Query("and", pattern="^(and|or)$", description="and = tous les concepts (converger) ; or = au moins un (élargir)"),
                  innovation_min: Optional[float] = Query(None, ge=0.0, le=1.0),
                  size: int = Query(60, ge=1, le=200),
                  dedup: bool = Query(True, description="Regrouper les sociétés sœurs")):
@@ -1544,7 +1545,7 @@ def topic_search(topic_id: int = Query(..., description="Topic (0–29) à explo
         keep = None
         for c in concepts:
             s = set(firms_of.get(c, []))
-            keep = s if keep is None else keep & s
+            keep = s if keep is None else (keep & s if cmode == "and" else keep | s)
             funnel.append({"label": labels.get(c, c.replace("_", " ")), "n": len(keep)})
         filters.append({"results_company_name": {"$in": sorted(keep or [])}})
     if jurisdiction:
