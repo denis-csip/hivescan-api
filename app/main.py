@@ -525,7 +525,7 @@ TOPIC_LABELS = {
 @app.get("/")
 def root():
     # Healthcheck + marqueur de build (le POC consomme /domain-meta, plus cette racine).
-    return {"message": "Search API is running", "build": "openalex-header-1", "lens": bool(LENS_KEY),
+    return {"message": "Search API is running", "build": "concepts-nav-1", "lens": bool(LENS_KEY),
             "openalex": bool(OPENALEX_KEY)}
 
 @app.get("/domains")
@@ -1464,11 +1464,46 @@ def search(
 
 _topic_cache = {}          # (domaine, topic, size) -> réponse complète (requêtes sans filtre)
 
+# --- Concepts d'un topic (navigation topics + mots-clés) ---------------------------------------
+# Écrits par hivescan-ingest/concepts.py dans `hivescan_topic_concepts` (un doc par domaine × topic) :
+# SN-grams SPÉCIFIQUES du topic (support × log lift sur le corpus), séparés en objets (groupes
+# nominaux) et actions (verbe + complément), chacun relié aux sociétés qui l'emploient DANS le topic.
+TOPIC_CONCEPTS_COLL = "hivescan_topic_concepts"
+_concepts_cache = {}
+
+def _topic_concepts_doc(domain, topic_id):
+    ctx = _domain_ctx(domain)
+    key = (ctx["domain"], topic_id)
+    if key not in _concepts_cache:
+        try:
+            _concepts_cache[key] = db[TOPIC_CONCEPTS_COLL].find_one(
+                {"domain": ctx["domain"], "topic": topic_id}, {"_id": 0})
+        except Exception:
+            return None
+    return _concepts_cache[key]
+
+@app.get("/topic-concepts")
+def topic_concepts(topic_id: int = Query(...), domain: Optional[str] = Query(None)):
+    """Concepts distinctifs d'un topic (objets / actions) avec le nombre de sociétés concernées."""
+    d = _topic_concepts_doc(domain, topic_id)
+    if not d:
+        return {"topic_id": topic_id, "available": False, "objects": [], "actions": []}
+    # Sociétés de chaque concept en INDICES dans une liste commune (compact) : le POC calcule en
+    # direct « combien en resterait-il si j'ajoute ce concept » sans nouvel appel.
+    firms_of = d.get("firms") or {}
+    names = sorted({n for fs in firms_of.values() for n in fs})
+    pos = {n: i for i, n in enumerate(names)}
+    slim = lambda items: [{"c": i["c"], "label": i["label"], "n": i["n"],
+                           "f": [pos[n] for n in firms_of.get(i["c"], []) if n in pos]} for i in items]
+    return {"topic_id": topic_id, "available": True, "n_firms": d.get("n_firms"),
+            "objects": slim(d.get("objects", [])), "actions": slim(d.get("actions", [])), "names": len(names)}
+
 @app.get("/topic-search")
 def topic_search(topic_id: int = Query(..., description="Topic (0–29) à explorer — découverte topic-first, sans mot-clé"),
                  domain: Optional[str] = Query(None),
                  jurisdiction: Optional[str] = Query(None),
                  keywords: Optional[List[str]] = Query(None, description="Optionnel : combine topic ∩ mot-clé"),
+                 concepts: Optional[List[str]] = Query(None, description="Optionnel : concepts du topic (ET logique)"),
                  innovation_min: Optional[float] = Query(None, ge=0.0, le=1.0),
                  size: int = Query(60, ge=1, le=200)):
     """Découverte TOPIC-FIRST (thèse) : renvoie les ENTREPRISES dont ≥1 article relève du
@@ -1479,12 +1514,26 @@ def topic_search(topic_id: int = Query(..., description="Topic (0–29) à explo
     coll = ctx["coll"]
     # Les affectations de topics sont STATIQUES : la réponse « topic seul » est déterministe
     # -> cache mémoire (évite count+aggregate ~1s à chaque clic ; cap petit, payloads ~1,3 Mo).
-    unfiltered = not (jurisdiction or keywords or innovation_min is not None)
+    unfiltered = not (jurisdiction or keywords or concepts or innovation_min is not None)
     tck = (ctx["domain"], topic_id, size)
     if unfiltered and tck in _topic_cache:
         return _topic_cache[tck]
     # Un article a top_3_topic_probs = [[id, prob], …] ; on matche une paire dont l'index 0 == topic_id.
-    filters = [{"possible_triz_levels": {"$elemMatch": {"top_3_topic_probs": {"$elemMatch": {"0": topic_id}}}}}]
+    topic_filter = {"possible_triz_levels": {"$elemMatch": {"top_3_topic_probs": {"$elemMatch": {"0": topic_id}}}}}
+    filters = [topic_filter]
+    # Entonnoir : topic seul, puis chaque concept ajouté (intersection des sociétés) -> nombre restant.
+    funnel = []
+    if concepts:
+        cd = _topic_concepts_doc(domain, topic_id) or {}
+        firms_of = cd.get("firms") or {}
+        labels = {i["c"]: i["label"] for i in (cd.get("objects", []) + cd.get("actions", []))}
+        funnel.append({"label": f"T{topic_id + 1}", "n": coll.count_documents(topic_filter)})
+        keep = None
+        for c in concepts:
+            s = set(firms_of.get(c, []))
+            keep = s if keep is None else keep & s
+            funnel.append({"label": labels.get(c, c.replace("_", " ")), "n": len(keep)})
+        filters.append({"results_company_name": {"$in": sorted(keep or [])}})
     if jurisdiction:
         countries = [j.strip().lower() for j in jurisdiction.split(",") if j.strip()]
         if countries:
@@ -1501,7 +1550,8 @@ def topic_search(topic_id: int = Query(..., description="Topic (0–29) à explo
     q = {"$and": filters}
     total = coll.count_documents(q)
     if not total:
-        return {"items": [], "total": 0, "topic_id": topic_id, "topic_label": _topic_meta(domain)["labels"].get(topic_id)}
+        return {"items": [], "total": 0, "topic_id": topic_id, "funnel": funnel,
+                "topic_label": _topic_meta(domain)["labels"].get(topic_id)}
     # Deux temps (Atlas M0). Phase 1 : classement par PERTINENCE-TOPIC (pas par ICI, qui est
     # global -> les mêmes méga-publiantes en tête de CHAQUE topic). topic_score = somme des
     # probabilités de CE topic sur les articles de l'entreprise -> varie par topic, fait
@@ -1537,7 +1587,8 @@ def topic_search(topic_id: int = Query(..., description="Topic (0–29) à explo
         doc["possible_triz_levels"] = arts[:20]
         doc["matched_article_count"] = len(arts)
     results.sort(key=lambda d: d.get("topic_score") or 0, reverse=True)   # pertinence-topic décroissante
-    out = _json_safe({"items": results, "total": total, "topic_id": topic_id, "topic_label": _topic_meta(domain)["labels"].get(topic_id)})
+    out = _json_safe({"items": results, "total": total, "topic_id": topic_id, "funnel": funnel,
+                      "topic_label": _topic_meta(domain)["labels"].get(topic_id)})
     if unfiltered:
         _cache_put(_topic_cache, tck, out, cap=6)
     return out
