@@ -525,7 +525,7 @@ TOPIC_LABELS = {
 @app.get("/")
 def root():
     # Healthcheck + marqueur de build (le POC consomme /domain-meta, plus cette racine).
-    return {"message": "Search API is running", "build": "topic-words-1", "lens": bool(LENS_KEY)}
+    return {"message": "Search API is running", "build": "lens-cache-1", "lens": bool(LENS_KEY)}
 
 @app.get("/domains")
 def list_domains():
@@ -659,15 +659,89 @@ def _norm(s):
     s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode()
     return re.sub(r"[^A-Z0-9]+", " ", s.upper()).strip()
 
-def _lens_post(payload):
-    req = urllib.request.Request(
-        "https://api.lens.org/patent/search",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Authorization": f"Bearer {LENS_KEY}", "Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=40) as r:
-        return json.load(r)
+# --- Accès Lens (brevets) : quota serré -> cache PERSISTANT + garde-fous ------------------
+# Lens Patent API : quota par MINUTE et par MOIS (~18 000 requêtes restantes au 24/09/2026).
+# Le tableau du POC demande les brevets de dizaines d'entreprises d'un coup (2 appels chacune),
+# et le cache mémoire était perdu à chaque mise en veille de Render (15 min sans visite) : tout
+# était redemandé. Désormais : réponses Lens ALLÉGÉES (champs utiles seulement, pour la limite
+# de 512 Mo d'Atlas M0) gardées 30 jours dans `hivescan_lens_cache` ; appels simultanés plafonnés ;
+# un 429 est retenté brièvement, puis signalé « occupé » (503) — jamais converti en « 0 brevet ».
+import threading
+_LENS_GATE = threading.BoundedSemaphore(int(os.getenv("LENS_CONCURRENCY", "3")))
+LENS_CACHE_DAYS = int(os.getenv("LENS_CACHE_DAYS", "30"))
+lens_cache_col = None
+if _MONGO_URI_RW:
+    try:
+        lens_cache_col = MongoClient(_MONGO_URI_RW)[DB_NAME]["hivescan_lens_cache"]
+        lens_cache_col.create_index("fetched_at", expireAfterSeconds=LENS_CACHE_DAYS * 86400)
+    except Exception:
+        lens_cache_col = None
+
+class LensBusy(Exception):
+    """Quota Lens momentanément épuisé (429 persistant)."""
+
+def _lens_trim(d):
+    """Garde la forme de la réponse Lens mais seulement les champs lus par l'API."""
+    out = []
+    for p in d.get("data") or []:
+        b = p.get("biblio") or {}
+        parties = b.get("parties") or {}
+        def names(k):
+            return [{"extracted_name": {"value": (x.get("extracted_name") or {}).get("value", "")}}
+                    for x in (parties.get(k) or [])][:20]
+        title = ((b.get("invention_title") or [{}])[0] or {}).get("text") or ""
+        ab = p.get("abstract")
+        abt = ((ab[0] or {}).get("text", "") if isinstance(ab, list) and ab else "") or ""
+        cpc = [{"symbol": c.get("symbol")} for c in ((b.get("classifications_cpc") or {}).get("classifications") or [])
+               if isinstance(c, dict) and c.get("symbol")][:8]
+        q = {"jurisdiction": p.get("jurisdiction"), "date_published": p.get("date_published"),
+             "biblio": {"invention_title": [{"text": title}],
+                        "parties": {"applicants": names("applicants"), "inventors": names("inventors")},
+                        "classifications_cpc": {"classifications": cpc}}}
+        if abt:
+            q["abstract"] = [{"text": abt[:500]}]
+        out.append(q)
+    return {"total": d.get("total", 0), "data": out}
+
+def _lens_post(payload, tries=3):
+    key = hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+    if lens_cache_col is not None:
+        try:
+            hit = lens_cache_col.find_one({"_id": key}, {"data": 1})
+            if hit:
+                return hit["data"]
+        except Exception:
+            pass
+    body = json.dumps(payload).encode("utf-8")
+    for attempt in range(tries):
+        req = urllib.request.Request(
+            "https://api.lens.org/patent/search", data=body,
+            headers={"Authorization": f"Bearer {LENS_KEY}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with _LENS_GATE:
+                with urllib.request.urlopen(req, timeout=40) as r:
+                    data = _lens_trim(json.load(r))
+            break
+        except urllib.error.HTTPError as e:
+            if e.code != 429:
+                raise
+            if attempt == tries - 1:
+                raise LensBusy()
+            wait = e.headers.get("x-rate-limit-retry-after-seconds") or e.headers.get("Retry-After") or 2 * (attempt + 1)
+            try:
+                wait = float(wait)
+            except ValueError:
+                wait = 2 * (attempt + 1)
+            time.sleep(min(max(wait, 0.5), 10))
+    if lens_cache_col is not None:
+        try:
+            lens_cache_col.replace_one({"_id": key}, {"_id": key, "data": data,
+                                                      "fetched_at": datetime.datetime.utcnow()}, upsert=True)
+        except Exception:
+            pass
+    return data
 
 # --- Désambiguïsation IA des brevets « à vérifier » (LLM peu gourmand) ------------
 # Un brevet au nom d'un homonyme même-pays, hors des mots-clés du domaine, est
@@ -832,10 +906,8 @@ def _lens_officer_patents(officers, dom, jurisdiction=None):
                "size": 50,
                "include": ["jurisdiction", "date_published", "biblio.invention_title", "biblio.parties",
                            "biblio.classifications_cpc", "abstract"]}
-    try:
-        d = _lens_post(payload)
-    except Exception:
-        return res
+    # Pas de try/except ici : un échec Lens doit remonter (503/502), pas devenir « 0 brevet » en cache.
+    d = _lens_post(payload)
     domset = set(_norm(dom).split()) if dom else set()
     otoks = {o: set(_norm(o).split()) for o in offs}
     for p in d.get("data", []):
@@ -883,6 +955,10 @@ def company_patents(name: str = Query(...), officers: List[str] = Query(None),
     try:
         company = _lens_company_patents(name)
         offs_res = _lens_officer_patents(officers, dom, jurisdiction)
+    except LensBusy:
+        # Quota Lens momentanément épuisé : le POC réessaiera (rien n'est mis en cache).
+        return JSONResponse(status_code=503, headers={"Retry-After": "30"},
+                            content={"detail": "Lens momentanément saturé, réessayer", "retry_after": 30})
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Lens: {e}")
     company_c = company["count"] if company["matched"] else 0
