@@ -1105,6 +1105,14 @@ def _load_openalex_key():
 OPENALEX_KEY = _load_openalex_key()
 _openalex_cache = {}
 
+def _openalex_headers():
+    # Sans clé : budget gratuit de 0,10 $/jour PARTAGÉ par l'IP (429 jusqu'à minuit UTC) ;
+    # avec clé : 10 000 req/jour. Clé en en-tête, jamais dans l'URL (qui finit dans les journaux).
+    h = {"User-Agent": "hivescan-poc (insa-strasbourg)"}
+    if OPENALEX_KEY:
+        h["Authorization"] = "Bearer " + OPENALEX_KEY
+    return h
+
 def _reconstruct_abstract(inv):
     if not inv:
         return None
@@ -1132,11 +1140,9 @@ def openalex(keywords: List[str] = Query(None), n: int = Query(8, ge=1, le=25)):
         "select": "title,publication_year,doi,cited_by_count,primary_location,authorships,abstract_inverted_index,open_access,id",
         "mailto": "hivescan-poc@insa-strasbourg.fr",
     }
-    if OPENALEX_KEY:
-        params["api_key"] = OPENALEX_KEY
     url = "https://api.openalex.org/works?" + urllib.parse.urlencode(params)
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "hivescan-poc (insa-strasbourg)"})
+        req = urllib.request.Request(url, headers=_openalex_headers())
         with urllib.request.urlopen(req, timeout=30) as r:
             data = json.load(r)
     except Exception as e:
@@ -1165,11 +1171,9 @@ def openalex(keywords: List[str] = Query(None), n: int = Query(8, ge=1, le=25)):
 _officer_cache = {}
 
 def _openalex_works(params):
-    if OPENALEX_KEY:
-        params["api_key"] = OPENALEX_KEY
     params.setdefault("mailto", "hivescan-poc@insa-strasbourg.fr")
     url = "https://api.openalex.org/works?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(url, headers={"User-Agent": "hivescan-poc (insa-strasbourg)"})
+    req = urllib.request.Request(url, headers=_openalex_headers())
     with urllib.request.urlopen(req, timeout=25) as r:
         return json.load(r)
 
