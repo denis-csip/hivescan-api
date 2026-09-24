@@ -525,7 +525,7 @@ TOPIC_LABELS = {
 @app.get("/")
 def root():
     # Healthcheck + marqueur de build (le POC consomme /domain-meta, plus cette racine).
-    return {"message": "Search API is running", "build": "concepts-nav-1", "lens": bool(LENS_KEY),
+    return {"message": "Search API is running", "build": "topic-overview-1", "lens": bool(LENS_KEY),
             "openalex": bool(OPENALEX_KEY)}
 
 @app.get("/domains")
@@ -559,7 +559,9 @@ def _topic_meta(domain):
         if not labels and ctx["domain"] == "energy":
             labels = TOPIC_LABELS
         words = {int(k): [w for w in (v or [])][:10] for k, v in (doc.get("top_words") or {}).items()}
-        ctx["topics"] = {"labels": labels, "words": words}
+        # Vue d'ensemble (hivescan-ingest/topicmap.py) : taille, dynamique, concepts phares par topic.
+        ctx["topics"] = {"labels": labels, "words": words, "overview": doc.get("overview") or [],
+                         "overview_years": doc.get("overview_years"), "overview_windows": doc.get("overview_windows")}
     return ctx["topics"]
 
 @app.get("/domain-meta")
@@ -568,7 +570,8 @@ def domain_meta(domain: str = Query(None)):
     ctx = _domain_ctx(domain)
     tm = _topic_meta(domain)
     return {"domain": ctx["domain"], "pop_radar": ctx["pop"], "feature_max": ctx["fmax"],
-            "topic_labels": tm["labels"], "topic_words": tm["words"]}
+            "topic_labels": tm["labels"], "topic_words": tm["words"], "topic_overview": tm["overview"],
+            "overview_years": tm["overview_years"], "overview_windows": tm["overview_windows"]}
 
 # --- Inventive Confidence Index (ICI) : 7 sous-indices, éditable par l'admin --------
 # Uniquement des signaux publics/objectifs/reproductibles (cf. thèse Connor). Chaque
