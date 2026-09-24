@@ -525,7 +525,7 @@ TOPIC_LABELS = {
 @app.get("/")
 def root():
     # Healthcheck + marqueur de build (le POC consomme /domain-meta, plus cette racine).
-    return {"message": "Search API is running", "build": "topic-overview-1", "lens": bool(LENS_KEY),
+    return {"message": "Search API is running", "build": "dedup-soeurs-1", "lens": bool(LENS_KEY),
             "openalex": bool(OPENALEX_KEY)}
 
 @app.get("/domains")
@@ -1295,6 +1295,7 @@ def search(
     innovation_min: Optional[float] = Query(None, ge=0.0, le=1.0, description="Minimum innovation index (0–1)"),
     innovation_max: Optional[float] = Query(None, ge=0.0, le=1.0, description="Maximum innovation index (0–1)"),
     domain: Optional[str] = Query(None, description="Domaine disciplinaire (energy, cosmetics, …)"),
+    dedup: bool = Query(True, description="Regrouper les sociétés sœurs (mêmes publications) sous leur représentante"),
 ):
     """
     Search documents. Title/abstract are inside possible_triz_levels (an array of subdocs).
@@ -1335,7 +1336,9 @@ def search(
     
     if company:
         filters.append({"results_company_name": regex_obj(company)})
-    
+    elif dedup:
+        filters.append(DEDUP_FILTER)      # recherche par nom : on montre la société exacte, sœur ou non
+
     if founder:
         filters.append({"officer_list": regex_obj(founder)})
     
@@ -1472,6 +1475,10 @@ _topic_cache = {}          # (domaine, topic, size) -> réponse complète (requ�
 # SN-grams SPÉCIFIQUES du topic (support × log lift sur le corpus), séparés en objets (groupes
 # nominaux) et actions (verbe + complément), chacun relié aux sociétés qui l'emploient DANS le topic.
 TOPIC_CONCEPTS_COLL = "hivescan_topic_concepts"
+# Sociétés SŒURS (hivescan-ingest/clones.py) : même ensemble d'articles, même dirigeant — familles de
+# sociétés de projet (jusqu'à 53). Seule la représentante apparaît dans les listes ; elle porte
+# `clone_of.size` et `clone_of.members`. 50 % des sociétés à articles de l'énergie sont concernées.
+DEDUP_FILTER = {"clone_of.hidden": {"$ne": True}}
 _concepts_cache = {}
 
 def _topic_concepts_doc(domain, topic_id):
@@ -1508,7 +1515,8 @@ def topic_search(topic_id: int = Query(..., description="Topic (0–29) à explo
                  keywords: Optional[List[str]] = Query(None, description="Optionnel : combine topic ∩ mot-clé"),
                  concepts: Optional[List[str]] = Query(None, description="Optionnel : concepts du topic (ET logique)"),
                  innovation_min: Optional[float] = Query(None, ge=0.0, le=1.0),
-                 size: int = Query(60, ge=1, le=200)):
+                 size: int = Query(60, ge=1, le=200),
+                 dedup: bool = Query(True, description="Regrouper les sociétés sœurs")):
     """Découverte TOPIC-FIRST (thèse) : renvoie les ENTREPRISES dont ≥1 article relève du
     topic choisi (sortie du topic-modeling LDA/ETM), classées par PERTINENCE-TOPIC, enrichies
     (radar + décomposition) comme /search — donc affichables tel quel dans la table du POC.
@@ -1518,11 +1526,13 @@ def topic_search(topic_id: int = Query(..., description="Topic (0–29) à explo
     # Les affectations de topics sont STATIQUES : la réponse « topic seul » est déterministe
     # -> cache mémoire (évite count+aggregate ~1s à chaque clic ; cap petit, payloads ~1,3 Mo).
     unfiltered = not (jurisdiction or keywords or concepts or innovation_min is not None)
-    tck = (ctx["domain"], topic_id, size)
+    tck = (ctx["domain"], topic_id, size, dedup)
     if unfiltered and tck in _topic_cache:
         return _topic_cache[tck]
     # Un article a top_3_topic_probs = [[id, prob], …] ; on matche une paire dont l'index 0 == topic_id.
     topic_filter = {"possible_triz_levels": {"$elemMatch": {"top_3_topic_probs": {"$elemMatch": {"0": topic_id}}}}}
+    if dedup:
+        topic_filter = {"$and": [topic_filter, DEDUP_FILTER]}
     filters = [topic_filter]
     # Entonnoir : topic seul, puis chaque concept ajouté (intersection des sociétés) -> nombre restant.
     funnel = []
