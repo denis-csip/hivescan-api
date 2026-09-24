@@ -525,7 +525,7 @@ TOPIC_LABELS = {
 @app.get("/")
 def root():
     # Healthcheck + marqueur de build (le POC consomme /domain-meta, plus cette racine).
-    return {"message": "Search API is running", "build": "ideas-ua-fix", "lens": bool(LENS_KEY)}
+    return {"message": "Search API is running", "build": "topic-words-1", "lens": bool(LENS_KEY)}
 
 @app.get("/domains")
 def list_domains():
@@ -539,12 +539,35 @@ def list_domains():
         out.append({"id": did, "label": meta["label"], "count": n, "populated": n > 0})
     return {"domains": out, "default": DEFAULT_DOMAIN}
 
+# --- Topics PAR DOMAINE : libellés + mots caractéristiques (SN-grams les plus probables du
+#     topic dans le modèle ETM), écrits par hivescan-ingest/topics.py dans `hivescan_topic_models`.
+#     Chaque domaine a SON modèle : les 30 topics de l'énergie ne décrivent pas le biotech.
+#     Repli : l'énergie garde la Table 9.9 en dur si la collection est vide ; les autres, rien.
+TOPIC_MODELS_COLL = "hivescan_topic_models"
+
+def _topic_meta(domain):
+    ctx = _domain_ctx(domain)
+    if "topics" not in ctx:
+        doc = None
+        try:
+            doc = db[TOPIC_MODELS_COLL].find_one({"domain": ctx["domain"]}, {"_id": 0})
+        except Exception:
+            pass
+        doc = doc or {}
+        labels = {int(k): v for k, v in (doc.get("labels") or {}).items() if v}
+        if not labels and ctx["domain"] == "energy":
+            labels = TOPIC_LABELS
+        words = {int(k): [w for w in (v or [])][:10] for k, v in (doc.get("top_words") or {}).items()}
+        ctx["topics"] = {"labels": labels, "words": words}
+    return ctx["topics"]
+
 @app.get("/domain-meta")
 def domain_meta(domain: str = Query(None)):
-    """Normalisation + libellés de topics propres au domaine choisi (radar population)."""
+    """Normalisation + libellés et mots-clés des topics propres au domaine choisi (radar population)."""
     ctx = _domain_ctx(domain)
-    return {"domain": ctx["domain"], "pop_radar": ctx["pop"],
-            "feature_max": ctx["fmax"], "topic_labels": TOPIC_LABELS}
+    tm = _topic_meta(domain)
+    return {"domain": ctx["domain"], "pop_radar": ctx["pop"], "feature_max": ctx["fmax"],
+            "topic_labels": tm["labels"], "topic_words": tm["words"]}
 
 # --- Inventive Confidence Index (ICI) : 7 sous-indices, éditable par l'admin --------
 # Uniquement des signaux publics/objectifs/reproductibles (cf. thèse Connor). Chaque
@@ -1397,7 +1420,7 @@ def topic_search(topic_id: int = Query(..., description="Topic (0–29) à explo
     q = {"$and": filters}
     total = coll.count_documents(q)
     if not total:
-        return {"items": [], "total": 0, "topic_id": topic_id, "topic_label": TOPIC_LABELS.get(topic_id)}
+        return {"items": [], "total": 0, "topic_id": topic_id, "topic_label": _topic_meta(domain)["labels"].get(topic_id)}
     # Deux temps (Atlas M0). Phase 1 : classement par PERTINENCE-TOPIC (pas par ICI, qui est
     # global -> les mêmes méga-publiantes en tête de CHAQUE topic). topic_score = somme des
     # probabilités de CE topic sur les articles de l'entreprise -> varie par topic, fait
@@ -1433,7 +1456,7 @@ def topic_search(topic_id: int = Query(..., description="Topic (0–29) à explo
         doc["possible_triz_levels"] = arts[:20]
         doc["matched_article_count"] = len(arts)
     results.sort(key=lambda d: d.get("topic_score") or 0, reverse=True)   # pertinence-topic décroissante
-    out = _json_safe({"items": results, "total": total, "topic_id": topic_id, "topic_label": TOPIC_LABELS.get(topic_id)})
+    out = _json_safe({"items": results, "total": total, "topic_id": topic_id, "topic_label": _topic_meta(domain)["labels"].get(topic_id)})
     if unfiltered:
         _cache_put(_topic_cache, tck, out, cap=6)
     return out
