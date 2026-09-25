@@ -525,7 +525,7 @@ TOPIC_LABELS = {
 @app.get("/")
 def root():
     # Healthcheck + marqueur de build (le POC consomme /domain-meta, plus cette racine).
-    return {"message": "Search API is running", "build": "homonymes-2", "lens": bool(LENS_KEY),
+    return {"message": "Search API is running", "build": "levees-1", "lens": bool(LENS_KEY),
             "openalex": bool(OPENALEX_KEY)}
 
 @app.get("/domains")
@@ -1051,6 +1051,15 @@ def funding_signal(f):
     debt = 0.30 if f.get("has_charges") else 0.0     # dette garantie = financement obtenu (GB)
     return round(min(1.0, equity + (0 if equity == 0 else debt * 0.5) + (debt if equity == 0 else 0)), 3)
 
+def raises_signal(r):
+    """Signal 0–1 à partir des VRAIS tours (hivescan-ingest/raises.py : SH01 lus + listes d'actionnaires).
+    Constitutions et apports de maison mère ne comptent pas. Même barème que funding_signal, +0,10 si un
+    fonds figure parmi les souscripteurs."""
+    n = (r or {}).get("n_tours") or 0
+    if n <= 0:
+        return 0.0
+    return round(min(1.0, 0.55 + 0.18 * (n - 1) + (0.10 if r.get("fonds") else 0.0)), 3)
+
 @app.get("/funding-coverage")
 def funding_coverage():
     """Couverture financement par pays (ouvert) : nb enrichies / trouvées / avec levée."""
@@ -1068,7 +1077,7 @@ def company_funding(name: str = Query(...), domain: str = Query(None)):
     doc = _domain_ctx(domain)["coll"].find_one(
         {"results_company_name": name},
         {"results_company_registry_url": 1, "results_company_company_number": 1,
-         "results_company_jurisdiction_code": 1, "_id": 0})
+         "results_company_jurisdiction_code": 1, "raises": 1, "_id": 0})
     if not doc:
         raise HTTPException(status_code=404, detail="Société introuvable.")
     jur = doc.get("results_company_jurisdiction_code")
@@ -1085,11 +1094,20 @@ def company_funding(name: str = Query(...), domain: str = Query(None)):
         return {"available": False, "number": key, "jurisdiction": jur,
                 "source": source, "reason": "pas encore enrichi"}
     sig = funding_signal(f)
+    equity, last = f.get("share_allotments") or 0, f.get("last_allotment")
+    r = doc.get("raises")
+    if r:
+        # GB : levées LUES (montant, tour, souscripteurs, preuve) au lieu du simple décompte de dépôts,
+        # qui comptait constitutions, apports de maison mère et réductions de capital comme des levées.
+        equity, last, source = r.get("n_tours") or 0, r.get("last_tour"), r.get("source") or source
+        sig = raises_signal(r)
+        if f.get("has_charges"):
+            sig = round(min(1.0, sig + (0.15 if sig else 0.30)), 3)
     return _json_safe({"available": True, "number": key, "jurisdiction": jur, "source": source,
-            "funding": f, "signal": sig,
-            "equity_raises": f.get("share_allotments") or 0,
+            "funding": f, "signal": sig, "raises": r,
+            "equity_raises": equity,
             "has_debt": bool(f.get("has_charges")),
-            "last_raise": f.get("last_allotment"),
+            "last_raise": last,
             # Santé (utile pour NO/DK où la levée n'est pas publiée) :
             "raises_tracked": f.get("raises_tracked", True),
             "status": f.get("status"),
@@ -1442,7 +1460,7 @@ def search(
                 "input": {"$slice": [{"$sortArray": {"input": "$_arts",
                           "sortBy": {"citationCount": -1}}}, ARTICLES_PER_COMPANY]},
                 "as": "a", "in": art_fields}}}},
-        {"$project": {"_id": 0, "_arts": 0}},
+        {"$project": {"_id": 0, "_arts": 0, "raises": 0}},
     ]
     try:
         full_by_name = {d["results_company_name"]: d for d in coll.aggregate(pipe)}
@@ -1642,7 +1660,7 @@ def oa_search(level: str = Query(..., pattern="^(field|subfield|topic)$"), id: i
     total = len(names)
     top = names[:size]                               # déjà classées par nombre d'articles dans le nœud
     by_name = {x["results_company_name"]: x for x in coll.find({"results_company_name": {"$in": top}, **DEDUP_FILTER},
-                                                              {"_id": 0})}
+                                                              {"_id": 0, "raises": 0})}
     results = []
     for n in top:
         doc = by_name.get(n)
@@ -1744,7 +1762,7 @@ def topic_search(topic_id: int = Query(..., description="Topic (0–29) à explo
     names = [r.get("results_company_name") for r in ranked if r.get("results_company_name")]
     score_by_name = {r["results_company_name"]: r.get("topic_score", 0) for r in ranked if r.get("results_company_name")}
     full_by_name = {d["results_company_name"]: d
-                    for d in coll.find({"results_company_name": {"$in": names}}, {"_id": 0})}
+                    for d in coll.find({"results_company_name": {"$in": names}}, {"_id": 0, "raises": 0})}
     results = [full_by_name[n] for n in names if n in full_by_name]
     for doc in results:
         doc["topic_score"] = round(score_by_name.get(doc["results_company_name"], 0), 3)
