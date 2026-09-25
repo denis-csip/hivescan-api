@@ -525,7 +525,7 @@ TOPIC_LABELS = {
 @app.get("/")
 def root():
     # Healthcheck + marqueur de build (le POC consomme /domain-meta, plus cette racine).
-    return {"message": "Search API is running", "build": "oa-nav-1", "lens": bool(LENS_KEY),
+    return {"message": "Search API is running", "build": "homonymes-1", "lens": bool(LENS_KEY),
             "openalex": bool(OPENALEX_KEY)}
 
 @app.get("/domains")
@@ -1408,7 +1408,8 @@ def search(
     # On EXCLUT seulement les gros champs (abstract, authors) responsables de l'OOM.
     art_fields = {f: f"$$a.{f}" for f in
                   ("title", "year", "citationCount", "ner", "top_3_topic_probs", "paperId",
-                   "fieldsOfStudy", "name", "score", "referenceCount")}
+                   "fieldsOfStudy", "name", "score", "referenceCount",
+                   "country_check")}   # homonymes (homonyms.py) : pays de l'auteur vs pays de la société
     # openAccessPdf : garder UNIQUEMENT l'URL (l'objet complet embarque un long disclaimer).
     art_fields["openAccessPdf"] = {"url": "$$a.openAccessPdf.url"}
     if keywords:
