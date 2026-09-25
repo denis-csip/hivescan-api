@@ -525,7 +525,7 @@ TOPIC_LABELS = {
 @app.get("/")
 def root():
     # Healthcheck + marqueur de build (le POC consomme /domain-meta, plus cette racine).
-    return {"message": "Search API is running", "build": "concepts-or-1", "lens": bool(LENS_KEY),
+    return {"message": "Search API is running", "build": "oa-nav-1", "lens": bool(LENS_KEY),
             "openalex": bool(OPENALEX_KEY)}
 
 @app.get("/domains")
@@ -1507,6 +1507,126 @@ def topic_concepts(topic_id: int = Query(...), domain: Optional[str] = Query(Non
                            "f": [pos[n] for n in firms_of.get(i["c"], []) if n in pos]} for i in items]
     return {"topic_id": topic_id, "available": True, "n_firms": d.get("n_firms"),
             "objects": slim(d.get("objects", [])), "actions": slim(d.get("actions", [])), "names": len(names)}
+
+# === Navigation par la classification des sujets OpenAlex (discipline > sous-discipline > sujet) ======
+# Écrite par hivescan-ingest/oatopics.py (hivescan_oa_taxonomy : sociétés par nœud, sœurs comptées une fois)
+# et concepts.py --group oa_subfield (hivescan_oa_concepts). Remplace les topics de la thèse comme point
+# d'entrée : ceux-ci ne regroupent pas mieux que le hasard (mesuré), les sujets OpenAlex sont nommés et
+# couvrent 87 % des articles. Filtre « énergie » : champ energy_lens (termes de l'Open Energy Ontology).
+_oa_cache = {}
+# Seuil « pertinence énergie » : ≥ 3 articles contenant un terme OEO. Mesuré (énergie, 2 312 sociétés
+# distinctes) : garde 62 % des sociétés (risque d'homonymie élevé 41 %) et écarte les 38 % où il atteint
+# 61 %. Signal PARTIEL : il ne remplace pas le contrôle des homonymes.
+ENERGY_MIN_ARTICLES = int(os.getenv("ENERGY_MIN_ARTICLES", "3"))
+
+def _oa(domain):
+    ctx = _domain_ctx(domain); dom = ctx["domain"]
+    if dom not in _oa_cache:
+        nodes = {}
+        for d in db["hivescan_oa_taxonomy"].find({"domain": dom}, {"_id": 0}):
+            nodes[(d["kind"], d["id"])] = d
+        energy = {d["results_company_name"] for d in ctx["coll"].find(
+            {"energy_lens.n": {"$gte": ENERGY_MIN_ARTICLES}, **DEDUP_FILTER}, {"results_company_name": 1})}
+        _oa_cache[dom] = {"nodes": nodes, "energy": energy}
+    return _oa_cache[dom]
+
+def _oa_summary(d, energy):
+    return {"id": d["id"], "name": d["name"], "parent": d.get("parent"), "n_firms": d["n_firms"],
+            "n_energy": sum(1 for n in d.get("firms", []) if n in energy), "n_articles": d.get("n_articles"),
+            "growth": d.get("growth")}
+
+@app.get("/oa-tree")
+def oa_tree(domain: Optional[str] = Query(None)):
+    """Disciplines et sous-disciplines (sans listes de sociétés) — page d'accueil de la navigation."""
+    o = _oa(domain); nodes, energy = o["nodes"], o["energy"]
+    fields = [_oa_summary(d, energy) for (k, _), d in nodes.items() if k == "field"]
+    subs = [_oa_summary(d, energy) for (k, _), d in nodes.items() if k == "subfield"]
+    for f in fields:
+        f["subfields"] = sorted([s for s in subs if s["parent"] == f["id"]], key=lambda s: -s["n_firms"])
+    fields.sort(key=lambda f: -f["n_firms"])
+    return _json_safe({"fields": fields, "n_energy": len(energy)})
+
+@app.get("/oa-node")
+def oa_node(level: str = Query(..., pattern="^(field|subfield|topic)$"), id: int = Query(...),
+            domain: Optional[str] = Query(None)):
+    """Un nœud : ses enfants (sous-disciplines ou sujets) et, pour une sous-discipline, ses concepts."""
+    o = _oa(domain); nodes, energy = o["nodes"], o["energy"]
+    d = nodes.get((level, id))
+    if not d:
+        raise HTTPException(status_code=404, detail="Nœud inconnu.")
+    child = {"field": "subfield", "subfield": "topic"}.get(level)
+    children = sorted([_oa_summary(c, energy) for (k, _), c in nodes.items() if k == child and c.get("parent") == id],
+                      key=lambda c: -c["n_firms"]) if child else []
+    out = {"level": level, **_oa_summary(d, energy), "children": children, "child_level": child}
+    if level in ("subfield", "topic"):
+        sf = id if level == "subfield" else d.get("parent")
+        cd = db["hivescan_oa_concepts"].find_one({"domain": _domain_ctx(domain)["domain"], "level": "subfield", "id": sf},
+                                                 {"_id": 0}) or {}
+        # Sociétés du nœud seulement (un sujet est un sous-ensemble de sa sous-discipline).
+        scope = set(d.get("firms", []))
+        firms_of = {c: [n for n in fs if n in scope] for c, fs in (cd.get("firms") or {}).items()}
+        names = sorted({n for fs in firms_of.values() for n in fs}); pos = {n: i for i, n in enumerate(names)}
+        slim = lambda items: [{"c": i["c"], "label": i["label"], "n": len(firms_of.get(i["c"], [])),
+                               "f": [pos[n] for n in firms_of.get(i["c"], [])]}
+                              for i in items if firms_of.get(i["c"])]
+        out.update({"available": bool(cd), "objects": slim(cd.get("objects", [])), "actions": slim(cd.get("actions", [])),
+                    "names": [n for n in names], "energy_idx": [pos[n] for n in names if n in energy]})
+    return _json_safe(out)
+
+@app.get("/oa-search")
+def oa_search(level: str = Query(..., pattern="^(field|subfield|topic)$"), id: int = Query(...),
+              domain: Optional[str] = Query(None),
+              concepts: Optional[List[str]] = Query(None), cmode: str = Query("and", pattern="^(and|or)$"),
+              energy: bool = Query(False, description="Seulement les sociétés « énergie » (termes OEO)"),
+              jurisdiction: Optional[str] = Query(None), size: int = Query(60, ge=1, le=200)):
+    """Sociétés d'un nœud, classées par nombre d'articles dans le nœud ; concepts (ET/OU), filtre énergie."""
+    ctx = _domain_ctx(domain); coll = ctx["coll"]
+    o = _oa(domain); d = o["nodes"].get((level, id))
+    if not d:
+        raise HTTPException(status_code=404, detail="Nœud inconnu.")
+    names = list(d.get("firms", [])); arts_in = dict(zip(names, d.get("firm_arts", [])))
+    funnel = [{"label": d["name"], "n": len(names)}]
+    if energy:
+        names = [n for n in names if n in o["energy"]]
+        funnel.append({"label": "pertinence énergie", "n": len(names)})
+    if concepts:
+        sf = id if level == "subfield" else d.get("parent")
+        cd = db["hivescan_oa_concepts"].find_one({"domain": ctx["domain"], "level": "subfield", "id": sf},
+                                                 {"firms": 1, "objects": 1, "actions": 1}) or {}
+        labels = {i["c"]: i["label"] for i in (cd.get("objects", []) + cd.get("actions", []))}
+        keep = None
+        for c in concepts:
+            s = set((cd.get("firms") or {}).get(c, []))
+            keep = s if keep is None else (keep & s if cmode == "and" else keep | s)
+        names = [n for n in names if n in (keep or set())]
+        funnel.append({"label": " · ".join(labels.get(c, c) for c in concepts), "n": len(names)})
+    if jurisdiction:
+        countries = {j.strip().lower() for j in jurisdiction.split(",") if j.strip()}
+        ok = {x["results_company_name"] for x in coll.find(
+            {"results_company_name": {"$in": names}, "results_company_jurisdiction_code": {"$in": list(countries)}},
+            {"results_company_name": 1})}
+        names = [n for n in names if n in ok]
+    total = len(names)
+    top = names[:size]                               # déjà classées par nombre d'articles dans le nœud
+    by_name = {x["results_company_name"]: x for x in coll.find({"results_company_name": {"$in": top}, **DEDUP_FILTER},
+                                                              {"_id": 0})}
+    results = []
+    for n in top:
+        doc = by_name.get(n)
+        if not doc:
+            continue
+        doc["node_articles"] = arts_in.get(n, 0)
+        doc["radar"] = company_radar(doc, ctx["fmax"])
+        ec = doc.get("employee_count")
+        if isinstance(ec, float) and ec != ec:
+            doc["employee_count"] = None
+        doc["score_breakdown"] = score_breakdown(doc, ctx["fmax"])
+        arts = sorted(doc.get("possible_triz_levels", []), key=lambda p: p.get("citationCount") or 0, reverse=True)
+        doc["matched_article_count"] = len(arts)
+        doc["possible_triz_levels"] = arts[:20]
+        results.append(doc)
+    return _json_safe({"items": results, "total": total, "funnel": funnel,
+                       "node": {"level": level, "id": id, "name": d["name"]}})
 
 @app.get("/topic-search")
 def topic_search(topic_id: int = Query(..., description="Topic (0–29) à explorer — découverte topic-first, sans mot-clé"),
