@@ -525,7 +525,7 @@ TOPIC_LABELS = {
 @app.get("/")
 def root():
     # Healthcheck + marqueur de build (le POC consomme /domain-meta, plus cette racine).
-    return {"message": "Search API is running", "build": "homonymes-1", "lens": bool(LENS_KEY),
+    return {"message": "Search API is running", "build": "homonymes-2", "lens": bool(LENS_KEY),
             "openalex": bool(OPENALEX_KEY)}
 
 @app.get("/domains")
@@ -1296,6 +1296,7 @@ def search(
     innovation_max: Optional[float] = Query(None, ge=0.0, le=1.0, description="Maximum innovation index (0–1)"),
     domain: Optional[str] = Query(None, description="Domaine disciplinaire (energy, cosmetics, …)"),
     dedup: bool = Query(True, description="Regrouper les sociétés sœurs (mêmes publications) sous leur représentante"),
+    corr: bool = Query(True, description="Indicateurs corrigés des homonymes (false = valeurs de la thèse)"),
 ):
     """
     Search documents. Title/abstract are inside possible_triz_levels (an array of subdocs).
@@ -1363,12 +1364,13 @@ def search(
 
 
     if innovation_min is not None or innovation_max is not None:
-        innovation_filter = {}
+        ii = {"$ifNull": ["$corrected.innovation_index", "$innovation_index"]} if corr else "$innovation_index"
+        conds = []
         if innovation_min is not None:
-            innovation_filter["$gte"] = innovation_min
+            conds.append({"$gte": [ii, innovation_min]})
         if innovation_max is not None:
-            innovation_filter["$lte"] = innovation_max
-        filters.append({"innovation_index": innovation_filter})
+            conds.append({"$lte": [ii, innovation_max]})
+        filters.append({"$expr": {"$and": conds}})
 
     mongo_query = {"$and": filters} if filters else {}
 
@@ -1389,10 +1391,13 @@ def search(
 
     ctx = _domain_ctx(domain)            # collection + normalisation propres au domaine
     coll = ctx["coll"]
+    # Indice corrigé (option 2) si présent, sinon celui de la thèse.
+    rank_expr = ({"$ifNull": ["$corrected.innovation_index", "$innovation_index"]}
+                 if (corr and rank_field == "innovation_index") else f"${rank_field}")
     ranked = list(coll.aggregate([
         {"$match": mongo_query},
-        {"$project": {"_id": 0, "results_company_name": 1, rank_field: 1}},
-        {"$sort": {rank_field: order}},
+        {"$project": {"_id": 0, "results_company_name": 1, "_rank": rank_expr}},
+        {"$sort": {"_rank": order}},
         {"$limit": MAX_SEARCH_DOCS},
     ]))
     names = [r.get("results_company_name") for r in ranked if r.get("results_company_name")]
@@ -1414,11 +1419,15 @@ def search(
     art_fields["openAccessPdf"] = {"url": "$$a.openAccessPdf.url"}
     if keywords:
         rgx = "(" + "|".join(re.escape(k) for k in keywords if k) + ")"
-        arts_src = {"$filter": {"input": {"$ifNull": ["$possible_triz_levels", []]}, "as": "a",
-                    "cond": {"$regexMatch": {
+        match_kw = {"$regexMatch": {
                         "input": {"$concat": [{"$ifNull": ["$$a.title", ""]}, " ",
                                               {"$ifNull": ["$$a.abstract", ""]}]},
-                        "regex": rgx, "options": "i"}}}}
+                        "regex": rgx, "options": "i"}}
+        cond = {"$and": [match_kw, {"$ne": ["$$a.country_check", HORS_PAYS]}]} if corr else match_kw
+        arts_src = {"$filter": {"input": {"$ifNull": ["$possible_triz_levels", []]}, "as": "a", "cond": cond}}
+    elif corr:
+        arts_src = {"$filter": {"input": {"$ifNull": ["$possible_triz_levels", []]}, "as": "a",
+                                "cond": {"$ne": ["$$a.country_check", HORS_PAYS]}}}
     else:
         arts_src = {"$ifNull": ["$possible_triz_levels", []]}
     pipe = [{"$match": {"results_company_name": {"$in": names}}},
@@ -1445,6 +1454,8 @@ def search(
     # --- Enrichissement + classement par potentiel d'innovation ------------------
     if topic_id is None:
         for doc in results:
+            if corr:
+                _apply_corr(doc)             # indicateurs sans les articles d'homonymes (option 2)
             # Radar 5 dimensions (avant nettoyage NaN : utilise l'effectif/âge bruts).
             doc["radar"] = company_radar(doc, ctx["fmax"])
             # NaN -> None pour un JSON propre (ex. employee_count manquant).
@@ -1480,6 +1491,26 @@ TOPIC_CONCEPTS_COLL = "hivescan_topic_concepts"
 # sociétés de projet (jusqu'à 53). Seule la représentante apparaît dans les listes ; elle porte
 # `clone_of.size` et `clone_of.members`. 50 % des sociétés à articles de l'énergie sont concernées.
 DEDUP_FILTER = {"clone_of.hidden": {"$ne": True}}
+# Option 2 des homonymes (hivescan-ingest/correct.py) : indicateurs recalculés SANS les articles
+# « hors pays » (auteur localisé hors du pays de la société = homonyme probable), rangés dans `corrected`.
+# Par défaut l'API sert la version corrigée (corr=true) ; les valeurs de la thèse restent dans `thesis`.
+CORR_FIELDS = ("innovation_index", "number_of_publications", "citations_per_article",
+               "average_triz_score", "ratio_publishing_officers")
+HORS_PAYS = "hors_pays"
+
+def _apply_corr(doc):
+    c = doc.get("corrected")
+    if not c:
+        return doc
+    doc["thesis"] = {f: doc.get(f) for f in CORR_FIELDS}
+    for f in CORR_FIELDS:
+        if f in c:
+            doc[f] = c[f]
+    doc["removed_articles"] = c.get("removed_articles", 0)
+    return doc
+
+def _keep_art(p, corr):
+    return not (corr and p.get("country_check") == HORS_PAYS)
 _concepts_cache = {}
 
 def _topic_concepts_doc(domain, topic_id):
@@ -1579,7 +1610,8 @@ def oa_search(level: str = Query(..., pattern="^(field|subfield|topic)$"), id: i
               domain: Optional[str] = Query(None),
               concepts: Optional[List[str]] = Query(None), cmode: str = Query("and", pattern="^(and|or)$"),
               energy: bool = Query(False, description="Seulement les sociétés « énergie » (termes OEO)"),
-              jurisdiction: Optional[str] = Query(None), size: int = Query(60, ge=1, le=200)):
+              jurisdiction: Optional[str] = Query(None), size: int = Query(60, ge=1, le=200),
+              corr: bool = Query(True, description="Indicateurs corrigés des homonymes (false = thèse)")):
     """Sociétés d'un nœud, classées par nombre d'articles dans le nœud ; concepts (ET/OU), filtre énergie."""
     ctx = _domain_ctx(domain); coll = ctx["coll"]
     o = _oa(domain); d = o["nodes"].get((level, id))
@@ -1617,12 +1649,15 @@ def oa_search(level: str = Query(..., pattern="^(field|subfield|topic)$"), id: i
         if not doc:
             continue
         doc["node_articles"] = arts_in.get(n, 0)
+        if corr:
+            _apply_corr(doc)
         doc["radar"] = company_radar(doc, ctx["fmax"])
         ec = doc.get("employee_count")
         if isinstance(ec, float) and ec != ec:
             doc["employee_count"] = None
         doc["score_breakdown"] = score_breakdown(doc, ctx["fmax"])
-        arts = sorted(doc.get("possible_triz_levels", []), key=lambda p: p.get("citationCount") or 0, reverse=True)
+        arts = sorted((p for p in doc.get("possible_triz_levels", []) if _keep_art(p, corr)),
+                      key=lambda p: p.get("citationCount") or 0, reverse=True)
         doc["matched_article_count"] = len(arts)
         doc["possible_triz_levels"] = arts[:20]
         results.append(doc)
@@ -1638,7 +1673,8 @@ def topic_search(topic_id: int = Query(..., description="Topic (0–29) à explo
                  cmode: str = Query("and", pattern="^(and|or)$", description="and = tous les concepts (converger) ; or = au moins un (élargir)"),
                  innovation_min: Optional[float] = Query(None, ge=0.0, le=1.0),
                  size: int = Query(60, ge=1, le=200),
-                 dedup: bool = Query(True, description="Regrouper les sociétés sœurs")):
+                 dedup: bool = Query(True, description="Regrouper les sociétés sœurs"),
+                 corr: bool = Query(True, description="Indicateurs corrigés des homonymes (false = thèse)")):
     """Découverte TOPIC-FIRST (thèse) : renvoie les ENTREPRISES dont ≥1 article relève du
     topic choisi (sortie du topic-modeling LDA/ETM), classées par PERTINENCE-TOPIC, enrichies
     (radar + décomposition) comme /search — donc affichables tel quel dans la table du POC.
@@ -1648,11 +1684,14 @@ def topic_search(topic_id: int = Query(..., description="Topic (0–29) à explo
     # Les affectations de topics sont STATIQUES : la réponse « topic seul » est déterministe
     # -> cache mémoire (évite count+aggregate ~1s à chaque clic ; cap petit, payloads ~1,3 Mo).
     unfiltered = not (jurisdiction or keywords or concepts or innovation_min is not None)
-    tck = (ctx["domain"], topic_id, size, dedup)
+    tck = (ctx["domain"], topic_id, size, dedup, corr)
     if unfiltered and tck in _topic_cache:
         return _topic_cache[tck]
     # Un article a top_3_topic_probs = [[id, prob], …] ; on matche une paire dont l'index 0 == topic_id.
-    topic_filter = {"possible_triz_levels": {"$elemMatch": {"top_3_topic_probs": {"$elemMatch": {"0": topic_id}}}}}
+    em = {"top_3_topic_probs": {"$elemMatch": {"0": topic_id}}}
+    if corr:                                         # option 2 : un article d'homonyme ne rattache pas au topic
+        em["country_check"] = {"$ne": HORS_PAYS}
+    topic_filter = {"possible_triz_levels": {"$elemMatch": em}}
     if dedup:
         topic_filter = {"$and": [topic_filter, DEDUP_FILTER]}
     filters = [topic_filter]
@@ -1681,7 +1720,8 @@ def topic_search(topic_id: int = Query(..., description="Topic (0–29) à explo
             kf.append({"possible_triz_levels.abstract": kwr})
         filters.append({"$or": kf})
     if innovation_min is not None:
-        filters.append({"innovation_index": {"$gte": innovation_min}})
+        filters.append({"$expr": {"$gte": [{"$ifNull": ["$corrected.innovation_index", "$innovation_index"]}
+                                           if corr else "$innovation_index", innovation_min]}})
     q = {"$and": filters}
     total = coll.count_documents(q)
     if not total:
@@ -1694,7 +1734,8 @@ def topic_search(topic_id: int = Query(..., description="Topic (0–29) à explo
     ranked = list(coll.aggregate([
         {"$match": q},
         {"$project": {"_id": 0, "results_company_name": 1, "innovation_index": 1,
-            "topic_score": {"$sum": {"$map": {"input": {"$ifNull": ["$possible_triz_levels", []]}, "as": "p", "in":
+            "topic_score": {"$sum": {"$map": {"input": {"$filter": {"input": {"$ifNull": ["$possible_triz_levels", []]},
+                "as": "a", "cond": {"$ne": ["$$a.country_check", HORS_PAYS if corr else "__aucun__"]}}}, "as": "p", "in":
                 {"$sum": {"$map": {"input": {"$ifNull": ["$$p.top_3_topic_probs", []]}, "as": "t", "in":
                     {"$cond": [{"$eq": [{"$arrayElemAt": ["$$t", 0]}, topic_id]}, {"$arrayElemAt": ["$$t", 1]}, 0]}}}}}}}}},
         {"$sort": {"topic_score": -1}},
@@ -1707,6 +1748,8 @@ def topic_search(topic_id: int = Query(..., description="Topic (0–29) à explo
     results = [full_by_name[n] for n in names if n in full_by_name]
     for doc in results:
         doc["topic_score"] = round(score_by_name.get(doc["results_company_name"], 0), 3)
+        if corr:
+            _apply_corr(doc)
         doc["radar"] = company_radar(doc, ctx["fmax"])
         ec = doc.get("employee_count")
         if isinstance(ec, float) and ec != ec:
@@ -1716,7 +1759,7 @@ def topic_search(topic_id: int = Query(..., description="Topic (0–29) à explo
         # payload = docs complets = ~17 Mo pour 60 entreprises très publiantes -> OOM/timeout
         # Render. Ici ~1,3 Mo, et ça montre POURQUOI l'entreprise relève du topic.
         arts = [p for p in doc.get("possible_triz_levels", [])
-                if any(isinstance(t, list) and t and t[0] == topic_id
+                if _keep_art(p, corr) and any(isinstance(t, list) and t and t[0] == topic_id
                        for t in (p.get("top_3_topic_probs") or []))]
         arts.sort(key=lambda p: p.get("citationCount") or 0, reverse=True)
         doc["possible_triz_levels"] = arts[:20]
