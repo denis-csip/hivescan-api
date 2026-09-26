@@ -535,7 +535,7 @@ TOPIC_LABELS = {
 @app.get("/")
 def root():
     # Healthcheck + marqueur de build (le POC consomme /domain-meta, plus cette racine).
-    return {"message": "Search API is running", "build": "oeo-2", "lens": bool(LENS_KEY),
+    return {"message": "Search API is running", "build": "oeo-3", "lens": bool(LENS_KEY),
             "openalex": bool(OPENALEX_KEY)}
 
 @app.get("/domains")
@@ -1614,6 +1614,15 @@ def _oa_summary(d, energy):
                     "oeo_label": d.get("oeo_label")})
     return out
 
+def _node_concepts(domain, tax, level, id, d):
+    """Concepts d'un nœud : sous-discipline OpenAlex (hivescan_oa_concepts, un sujet prend ceux de sa
+    sous-discipline) ou classe de la carte de l'énergie (hivescan_oeo_concepts, concepts.py --group oeo_class)."""
+    dom = _domain_ctx(domain)["domain"]
+    if tax == "oeo":
+        return db["hivescan_oeo_concepts"].find_one({"domain": dom, "id": id}, {"_id": 0}) or {}
+    sf = id if level == "subfield" else d.get("parent")
+    return db["hivescan_oa_concepts"].find_one({"domain": dom, "level": "subfield", "id": sf}, {"_id": 0}) or {}
+
 @app.get("/oa-tree")
 def oa_tree(domain: Optional[str] = Query(None), tax: str = Query("oa", pattern="^(oa|oeo)$")):
     """Premiers niveaux de la carte (sans listes de sociétés) : disciplines > sous-disciplines (OpenAlex)
@@ -1645,10 +1654,8 @@ def oa_node(level: str = Query(..., pattern=TAX_LEVELS), id: int = Query(...),
                           key=lambda c: -c["n_firms"]) if child else []
     out = {"level": level, **_oa_summary(d, energy), "children": children, "child_level": child,
            "path": _oa_path(nodes, d), "tax": tax}
-    if level in ("subfield", "topic"):
-        sf = id if level == "subfield" else d.get("parent")
-        cd = db["hivescan_oa_concepts"].find_one({"domain": _domain_ctx(domain)["domain"], "level": "subfield", "id": sf},
-                                                 {"_id": 0}) or {}
+    if tax == "oeo" or level in ("subfield", "topic"):
+        cd = _node_concepts(domain, tax, level, id, d)
         # Sociétés du nœud seulement (un sujet est un sous-ensemble de sa sous-discipline).
         scope = set(d.get("firms", []))
         firms_of = {c: [n for n in fs if n in scope] for c, fs in (cd.get("firms") or {}).items()}
@@ -1680,9 +1687,7 @@ def oa_search(level: str = Query(..., pattern=TAX_LEVELS), id: int = Query(...),
         names = [n for n in names if n in o["energy"]]
         funnel.append({"label": "pertinence énergie", "n": len(names)})
     if concepts:
-        sf = id if level == "subfield" else d.get("parent")
-        cd = db["hivescan_oa_concepts"].find_one({"domain": ctx["domain"], "level": "subfield", "id": sf},
-                                                 {"firms": 1, "objects": 1, "actions": 1}) or {}
+        cd = _node_concepts(domain, tax, level, id, d)
         labels = {i["c"]: i["label"] for i in (cd.get("objects", []) + cd.get("actions", []))}
         keep = None
         for c in concepts:
