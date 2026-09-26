@@ -224,6 +224,16 @@ async def update_study(sid: str, request: Request):
             patch["position"] = float(body.get("position"))
         except (TypeError, ValueError):
             pass
+    # « Mon étude » (panier) : le POC renvoie la liste des entreprises retenues à chaque coche.
+    # Bornée à 200 entreprises + garde-fou taille (document Mongo ≤ 16 Mo).
+    if isinstance(body.get("results"), list):
+        snap = body["results"][:200]
+        try:
+            if len(json.dumps(snap)) < 9_000_000:
+                patch["results"] = snap
+                patch["result_count"] = len(snap)
+        except Exception:
+            pass
     if patch:
         patch["updated"] = datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
         studies_col.update_one({"sid": sid, "email": email}, {"$set": patch})
@@ -525,7 +535,7 @@ TOPIC_LABELS = {
 @app.get("/")
 def root():
     # Healthcheck + marqueur de build (le POC consomme /domain-meta, plus cette racine).
-    return {"message": "Search API is running", "build": "levees-1", "lens": bool(LENS_KEY),
+    return {"message": "Search API is running", "build": "parcours-1", "lens": bool(LENS_KEY),
             "openalex": bool(OPENALEX_KEY)}
 
 @app.get("/domains")
@@ -1629,7 +1639,8 @@ def oa_search(level: str = Query(..., pattern="^(field|subfield|topic)$"), id: i
               concepts: Optional[List[str]] = Query(None), cmode: str = Query("and", pattern="^(and|or)$"),
               energy: bool = Query(False, description="Seulement les sociétés « énergie » (termes OEO)"),
               jurisdiction: Optional[str] = Query(None), size: int = Query(60, ge=1, le=200),
-              corr: bool = Query(True, description="Indicateurs corrigés des homonymes (false = thèse)")):
+              corr: bool = Query(True, description="Indicateurs corrigés des homonymes (false = thèse)"),
+              keywords: Optional[List[str]] = Query(None, description="Affiner : mot(s) dans le titre/résumé d'un article")):
     """Sociétés d'un nœud, classées par nombre d'articles dans le nœud ; concepts (ET/OU), filtre énergie."""
     ctx = _domain_ctx(domain); coll = ctx["coll"]
     o = _oa(domain); d = o["nodes"].get((level, id))
@@ -1657,6 +1668,20 @@ def oa_search(level: str = Query(..., pattern="^(field|subfield|topic)$"), id: i
             {"results_company_name": {"$in": names}, "results_company_jurisdiction_code": {"$in": list(countries)}},
             {"results_company_name": 1})}
         names = [n for n in names if n in ok]
+    kws = [k.strip() for k in (keywords or []) if k and k.strip()]
+    if kws:
+        # Tous les mots (ET), chacun dans le titre ou le résumé d'au moins un article (hors pays exclus si corr).
+        conds = []
+        for k in kws:
+            rx = {"$regex": re.escape(k), "$options": "i"}
+            art = {"$or": [{"title": rx}, {"abstract": rx}]}
+            if corr:
+                art = {"$and": [art, {"country_check": {"$ne": HORS_PAYS}}]}
+            conds.append({"possible_triz_levels": {"$elemMatch": art}})
+        ok = {x["results_company_name"] for x in coll.find({"results_company_name": {"$in": names}, "$and": conds},
+                                                            {"results_company_name": 1})}
+        names = [n for n in names if n in ok]
+        funnel.append({"label": " + ".join(kws), "n": len(names)})
     total = len(names)
     top = names[:size]                               # déjà classées par nombre d'articles dans le nœud
     by_name = {x["results_company_name"]: x for x in coll.find({"results_company_name": {"$in": top}, **DEDUP_FILTER},
