@@ -535,7 +535,7 @@ TOPIC_LABELS = {
 @app.get("/")
 def root():
     # Healthcheck + marqueur de build (le POC consomme /domain-meta, plus cette racine).
-    return {"message": "Search API is running", "build": "oeo-1", "lens": bool(LENS_KEY),
+    return {"message": "Search API is running", "build": "oeo-2", "lens": bool(LENS_KEY),
             "openalex": bool(OPENALEX_KEY)}
 
 @app.get("/domains")
@@ -1586,13 +1586,16 @@ TAX_LEVELS = "^(field|subfield|topic|family|class)$"
 
 def _oa(domain, tax="oa"):
     ctx = _domain_ctx(domain); dom = ctx["domain"]; key = (dom, tax)
+    # Recharge toutes les heures : une carte reconstruite (oatopics.py / oeomap.py) apparaît sans redéploiement.
+    if key in _oa_cache and time.time() - _oa_cache[key].get("t", 0) > 3600:
+        _oa_cache.pop(key, None)
     if key not in _oa_cache:
         nodes = {}
         for d in db[TAX_COLL.get(tax, TAX_COLL["oa"])].find({"domain": dom}, {"_id": 0}):
             nodes[(d["kind"], d["id"])] = d
         energy = {d["results_company_name"] for d in ctx["coll"].find(
             {"energy_lens.n": {"$gte": ENERGY_MIN_ARTICLES}, **DEDUP_FILTER}, {"results_company_name": 1})}
-        _oa_cache[key] = {"nodes": nodes, "energy": energy}
+        _oa_cache[key] = {"nodes": nodes, "energy": energy, "t": time.time()}
     return _oa_cache[key]
 
 def _oa_path(nodes, d):
