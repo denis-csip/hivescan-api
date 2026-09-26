@@ -535,7 +535,7 @@ TOPIC_LABELS = {
 @app.get("/")
 def root():
     # Healthcheck + marqueur de build (le POC consomme /domain-meta, plus cette racine).
-    return {"message": "Search API is running", "build": "parcours-1", "lens": bool(LENS_KEY),
+    return {"message": "Search API is running", "build": "oeo-1", "lens": bool(LENS_KEY),
             "openalex": bool(OPENALEX_KEY)}
 
 @app.get("/domains")
@@ -571,6 +571,7 @@ def _topic_meta(domain):
         words = {int(k): [w for w in (v or [])][:10] for k, v in (doc.get("top_words") or {}).items()}
         # Vue d'ensemble (hivescan-ingest/topicmap.py) : taille, dynamique, concepts phares par topic.
         ctx["topics"] = {"labels": labels, "words": words, "overview": doc.get("overview") or [],
+                         "oeo": {int(k): v for k, v in (doc.get("oeo_labels") or {}).items()},
                          "overview_years": doc.get("overview_years"), "overview_windows": doc.get("overview_windows")}
     return ctx["topics"]
 
@@ -581,6 +582,7 @@ def domain_meta(domain: str = Query(None)):
     tm = _topic_meta(domain)
     return {"domain": ctx["domain"], "pop_radar": ctx["pop"], "feature_max": ctx["fmax"],
             "topic_labels": tm["labels"], "topic_words": tm["words"], "topic_overview": tm["overview"],
+            "topic_oeo": tm.get("oeo") or {},
             "overview_years": tm["overview_years"], "overview_windows": tm["overview_windows"]}
 
 # --- Inventive Confidence Index (ICI) : 7 sous-indices, éditable par l'admin --------
@@ -1579,45 +1581,67 @@ _oa_cache = {}
 # 61 %. Signal PARTIEL : il ne remplace pas le contrôle des homonymes.
 ENERGY_MIN_ARTICLES = int(os.getenv("ENERGY_MIN_ARTICLES", "3"))
 
-def _oa(domain):
-    ctx = _domain_ctx(domain); dom = ctx["domain"]
-    if dom not in _oa_cache:
+TAX_COLL = {"oa": "hivescan_oa_taxonomy", "oeo": "hivescan_oeo_map"}
+TAX_LEVELS = "^(field|subfield|topic|family|class)$"
+
+def _oa(domain, tax="oa"):
+    ctx = _domain_ctx(domain); dom = ctx["domain"]; key = (dom, tax)
+    if key not in _oa_cache:
         nodes = {}
-        for d in db["hivescan_oa_taxonomy"].find({"domain": dom}, {"_id": 0}):
+        for d in db[TAX_COLL.get(tax, TAX_COLL["oa"])].find({"domain": dom}, {"_id": 0}):
             nodes[(d["kind"], d["id"])] = d
         energy = {d["results_company_name"] for d in ctx["coll"].find(
             {"energy_lens.n": {"$gte": ENERGY_MIN_ARTICLES}, **DEDUP_FILTER}, {"results_company_name": 1})}
-        _oa_cache[dom] = {"nodes": nodes, "energy": energy}
-    return _oa_cache[dom]
+        _oa_cache[key] = {"nodes": nodes, "energy": energy}
+    return _oa_cache[key]
+
+def _oa_path(nodes, d):
+    """Ancêtres d'un nœud, de la racine au parent : [{level, id, name}] (fil d'Ariane)."""
+    byid = {n["id"]: n for n in nodes.values()}; out = []; p = d.get("parent")
+    while p in byid and len(out) < 8:
+        a = byid[p]; out.insert(0, {"level": a["kind"], "id": a["id"], "name": a["name"]}); p = a.get("parent")
+    return out
 
 def _oa_summary(d, energy):
-    return {"id": d["id"], "name": d["name"], "parent": d.get("parent"), "n_firms": d["n_firms"],
-            "n_energy": sum(1 for n in d.get("firms", []) if n in energy), "n_articles": d.get("n_articles"),
-            "growth": d.get("growth")}
+    out = {"id": d["id"], "name": d["name"], "parent": d.get("parent"), "n_firms": d["n_firms"],
+           "n_energy": sum(1 for n in d.get("firms", []) if n in energy), "n_articles": d.get("n_articles"),
+           "growth": d.get("growth")}
+    if d.get("kind") in ("family", "class"):
+        out.update({"kind": d["kind"], "family": d.get("family"), "topics": d.get("topics") or [],
+                    "oeo_label": d.get("oeo_label")})
+    return out
 
 @app.get("/oa-tree")
-def oa_tree(domain: Optional[str] = Query(None)):
-    """Disciplines et sous-disciplines (sans listes de sociétés) — page d'accueil de la navigation."""
-    o = _oa(domain); nodes, energy = o["nodes"], o["energy"]
-    fields = [_oa_summary(d, energy) for (k, _), d in nodes.items() if k == "field"]
-    subs = [_oa_summary(d, energy) for (k, _), d in nodes.items() if k == "subfield"]
+def oa_tree(domain: Optional[str] = Query(None), tax: str = Query("oa", pattern="^(oa|oeo)$")):
+    """Premiers niveaux de la carte (sans listes de sociétés) : disciplines > sous-disciplines (OpenAlex)
+    ou familles > classes de l'Open Energy Ontology (tax=oeo)."""
+    o = _oa(domain, tax); nodes, energy = o["nodes"], o["energy"]
+    top, second = ("family", "class") if tax == "oeo" else ("field", "subfield")
+    fields = [_oa_summary(d, energy) for (k, _), d in nodes.items() if k == top]
+    subs = [_oa_summary(d, energy) for (k, _), d in nodes.items() if k == second]
     for f in fields:
         f["subfields"] = sorted([s for s in subs if s["parent"] == f["id"]], key=lambda s: -s["n_firms"])
     fields.sort(key=lambda f: -f["n_firms"])
     return _json_safe({"fields": fields, "n_energy": len(energy)})
 
 @app.get("/oa-node")
-def oa_node(level: str = Query(..., pattern="^(field|subfield|topic)$"), id: int = Query(...),
-            domain: Optional[str] = Query(None)):
-    """Un nœud : ses enfants (sous-disciplines ou sujets) et, pour une sous-discipline, ses concepts."""
-    o = _oa(domain); nodes, energy = o["nodes"], o["energy"]
+def oa_node(level: str = Query(..., pattern=TAX_LEVELS), id: int = Query(...),
+            domain: Optional[str] = Query(None), tax: str = Query("oa", pattern="^(oa|oeo)$")):
+    """Un nœud : ses enfants (sous-disciplines, sujets ou sous-classes) et, pour une sous-discipline, ses concepts."""
+    o = _oa(domain, tax); nodes, energy = o["nodes"], o["energy"]
     d = nodes.get((level, id))
     if not d:
         raise HTTPException(status_code=404, detail="Nœud inconnu.")
-    child = {"field": "subfield", "subfield": "topic"}.get(level)
-    children = sorted([_oa_summary(c, energy) for (k, _), c in nodes.items() if k == child and c.get("parent") == id],
-                      key=lambda c: -c["n_firms"]) if child else []
-    out = {"level": level, **_oa_summary(d, energy), "children": children, "child_level": child}
+    if tax == "oeo":
+        child = "class"
+        children = sorted([_oa_summary(c, energy) for c in nodes.values() if c.get("parent") == id],
+                          key=lambda c: -c["n_firms"])
+    else:
+        child = {"field": "subfield", "subfield": "topic"}.get(level)
+        children = sorted([_oa_summary(c, energy) for (k, _), c in nodes.items() if k == child and c.get("parent") == id],
+                          key=lambda c: -c["n_firms"]) if child else []
+    out = {"level": level, **_oa_summary(d, energy), "children": children, "child_level": child,
+           "path": _oa_path(nodes, d), "tax": tax}
     if level in ("subfield", "topic"):
         sf = id if level == "subfield" else d.get("parent")
         cd = db["hivescan_oa_concepts"].find_one({"domain": _domain_ctx(domain)["domain"], "level": "subfield", "id": sf},
@@ -1634,7 +1658,8 @@ def oa_node(level: str = Query(..., pattern="^(field|subfield|topic)$"), id: int
     return _json_safe(out)
 
 @app.get("/oa-search")
-def oa_search(level: str = Query(..., pattern="^(field|subfield|topic)$"), id: int = Query(...),
+def oa_search(level: str = Query(..., pattern=TAX_LEVELS), id: int = Query(...),
+              tax: str = Query("oa", pattern="^(oa|oeo)$"),
               domain: Optional[str] = Query(None),
               concepts: Optional[List[str]] = Query(None), cmode: str = Query("and", pattern="^(and|or)$"),
               energy: bool = Query(False, description="Seulement les sociétés « énergie » (termes OEO)"),
@@ -1643,7 +1668,7 @@ def oa_search(level: str = Query(..., pattern="^(field|subfield|topic)$"), id: i
               keywords: Optional[List[str]] = Query(None, description="Affiner : mot(s) dans le titre/résumé d'un article")):
     """Sociétés d'un nœud, classées par nombre d'articles dans le nœud ; concepts (ET/OU), filtre énergie."""
     ctx = _domain_ctx(domain); coll = ctx["coll"]
-    o = _oa(domain); d = o["nodes"].get((level, id))
+    o = _oa(domain, tax); d = o["nodes"].get((level, id))
     if not d:
         raise HTTPException(status_code=404, detail="Nœud inconnu.")
     names = list(d.get("firms", [])); arts_in = dict(zip(names, d.get("firm_arts", [])))
