@@ -535,7 +535,7 @@ TOPIC_LABELS = {
 @app.get("/")
 def root():
     # Healthcheck + marqueur de build (le POC consomme /domain-meta, plus cette racine).
-    return {"message": "Search API is running", "build": "oeo-3", "lens": bool(LENS_KEY),
+    return {"message": "Search API is running", "build": "oeo-4", "lens": bool(LENS_KEY),
             "openalex": bool(OPENALEX_KEY)}
 
 @app.get("/domains")
@@ -1611,7 +1611,8 @@ def _oa_summary(d, energy):
            "growth": d.get("growth")}
     if d.get("kind") in ("family", "class"):
         out.update({"kind": d["kind"], "family": d.get("family"), "topics": d.get("topics") or [],
-                    "oeo_label": d.get("oeo_label")})
+                    "oeo_label": d.get("oeo_label"), "n_tech": d.get("n_tech", d["n_firms"]),
+                    "n_art_firms": d.get("n_art_firms", d["n_firms"])})
     return out
 
 def _node_concepts(domain, tax, level, id, d):
@@ -1682,6 +1683,7 @@ def oa_search(level: str = Query(..., pattern=TAX_LEVELS), id: int = Query(...),
     if not d:
         raise HTTPException(status_code=404, detail="Nœud inconnu.")
     names = list(d.get("firms", [])); arts_in = dict(zip(names, d.get("firm_arts", [])))
+    src_in = dict(zip(names, d.get("src") or []))       # carte de l'énergie : comment la société a été placée
     funnel = [{"label": d["name"], "n": len(names)}]
     if energy:
         names = [n for n in names if n in o["energy"]]
@@ -1725,6 +1727,8 @@ def oa_search(level: str = Query(..., pattern=TAX_LEVELS), id: int = Query(...),
         if not doc:
             continue
         doc["node_articles"] = arts_in.get(n, 0)
+        if src_in:
+            doc["node_src"] = src_in.get(n)
         if corr:
             _apply_corr(doc)
         doc["radar"] = company_radar(doc, ctx["fmax"])
